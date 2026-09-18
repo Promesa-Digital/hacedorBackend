@@ -9,7 +9,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from .embeds import normalize_spotify_embed_url, normalize_youtube_embed_url
-from .models import Article, Author, Category, NewsletterSubscriber, Region, Tag
+from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag
 
 
 class EmbedNormalizationTests(SimpleTestCase):
@@ -452,3 +452,91 @@ class PublicArticleEdgeCaseTests(APITestCase):
         )
         article.refresh_from_db()
         self.assertFalse(article.has_narration)
+
+
+class EventPublicTests(APITestCase):
+    def setUp(self):
+        self.published = Event.objects.create(
+            title='Conversatorio de narrativa andina',
+            description='Mesa redonda con autores de la región.',
+            starts_at=timezone.now() + timezone.timedelta(days=10),
+            location='Biblioteca Municipal, Arequipa',
+            status='published',
+        )
+        Event.objects.create(
+            title='Evento todavía sin confirmar',
+            starts_at=timezone.now() + timezone.timedelta(days=20),
+            status='draft',
+        )
+
+    def test_list_only_returns_published(self):
+        res = self.client.get('/api/events/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data), 1)
+        self.assertEqual(res.data[0]['title'], 'Conversatorio de narrativa andina')
+
+    def test_public_payload_is_camel_case_and_hides_status(self):
+        res = self.client.get('/api/events/')
+        item = res.data[0]
+        self.assertIn('startsAt', item)
+        self.assertIn('coverImageUrl', item)
+        self.assertIn('externalUrl', item)
+        self.assertNotIn('status', item)
+        self.assertNotIn('starts_at', item)
+
+    def test_slug_is_generated_from_title(self):
+        self.assertEqual(self.published.slug, 'conversatorio-de-narrativa-andina')
+
+    def test_slug_collision_gets_suffix(self):
+        other = Event.objects.create(
+            title='Conversatorio de narrativa andina',
+            starts_at=timezone.now(),
+            status='published',
+        )
+        self.assertNotEqual(other.slug, self.published.slug)
+
+
+class EventAdminTests(AdminAPITestCase):
+    def test_list_requires_authentication(self):
+        self.client.credentials()
+        res = self.client.get('/api/admin/events/')
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_create_and_list_includes_drafts(self):
+        res = self.client.post(
+            '/api/admin/events/',
+            {
+                'title': 'Taller de crónica',
+                'description': 'Cuatro sesiones.',
+                'startsAt': '2026-11-02T18:30:00-05:00',
+                'location': 'Casa de la Cultura, Cusco',
+                'status': 'draft',
+            },
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data['title'], 'Taller de crónica')
+        self.assertEqual(res.data['status'], 'draft')
+
+        listed = self.client.get('/api/admin/events/')
+        self.assertEqual(len(listed.data), 1)
+        # El borrador no sale en el endpoint público
+        self.assertEqual(len(self.client.get('/api/events/').data), 0)
+
+    def test_starts_at_is_required(self):
+        res = self.client.post('/api/admin/events/', {'title': 'Sin fecha'}, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('startsAt', res.data)
+
+    def test_patch_publishes_a_draft(self):
+        event = Event.objects.create(title='Borrador', starts_at=timezone.now(), status='draft')
+        res = self.client.patch(f'/api/admin/events/{event.id}/', {'status': 'published'}, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        event.refresh_from_db()
+        self.assertEqual(event.status, 'published')
+
+    def test_delete_removes_the_event(self):
+        event = Event.objects.create(title='A borrar', starts_at=timezone.now(), status='published')
+        res = self.client.delete(f'/api/admin/events/{event.id}/')
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Event.objects.filter(pk=event.pk).exists())

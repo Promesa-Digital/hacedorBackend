@@ -59,6 +59,7 @@ Nunca publique sus credenciales ni reutilice esa cuenta en producción.
 | GET | `/api/tags/<slug>/` | `getTagBySlug()` |
 | GET | `/api/categories/` | `getCategories()` |
 | GET | `/api/categories/<slug>/` | `getCategoryBySlug()` — incluye `featuredVideoUrl`/`featuredPodcastUrl`, elegidos a mano desde el panel (nunca adivinados de un artículo) |
+| GET | `/api/events/` | `getEvents()` — agenda pública, solo eventos `published`; el frontend separa próximos de pasados por `startsAt` |
 | POST | `/api/newsletter/` `{email}` | `subscribeToNewsletter()` en `lib/newsletter.ts` — suscribirse dos veces con el mismo correo responde 200 `{email, alreadySubscribed: true}`, no un error |
 
 ## Endpoints de admin (JWT requerido)
@@ -80,6 +81,8 @@ Nunca publique sus credenciales ni reutilice esa cuenta en producción.
 | DELETE | `/api/admin/tags/<id>/` | `deleteTag()` |
 | POST | `/api/admin/regions/` `{name, code}` | `addRegion()` en `lib/taxonomy.ts` |
 | DELETE | `/api/admin/regions/<id>/` | `deleteRegion()` — `on_delete=SET_NULL` en `Article.region`/`Author.region`, así que nunca falla por referencias existentes |
+| GET/POST | `/api/admin/events/` | `getEventsForAdmin()` (incluye borradores) y `createEvent()` en `lib/events.ts` — acepta multipart si se sube `coverImage` |
+| GET/PATCH/DELETE | `/api/admin/events/<id>/` | `updateEvent()` / `deleteEvent()` — borrado directo, sin papelera (un evento no tiene el peso editorial de un artículo) |
 | GET | `/api/admin/categories/` | Lista para la sección "Categorías" del panel |
 | PATCH | `/api/admin/categories/<slug>/` `{featuredVideoUrl?, featuredPodcastUrl?}` | `updateCategoryMedia()` en `lib/taxonomy.ts` — únicos campos escribibles; `slug`/`label`/`colorVariant` son `read_only` a propósito (atados a una ruta fija del frontend) |
 

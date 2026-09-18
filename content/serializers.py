@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import Article, Author, Category, NewsletterSubscriber, Region, Tag, Volume
+from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag, Volume
 
 
 def _absolute_file_url(field_file, context):
@@ -232,3 +232,36 @@ class ArticleAdminSerializer(ArticleDetailSerializer):
         if normalized and not normalized.startswith('https://open.spotify.com/embed/'):
             raise serializers.ValidationError('Debe ser una URL válida de Spotify.')
         return normalized
+
+
+class EventSerializer(serializers.ModelSerializer):
+    """Forma 1:1 con la interfaz EventItem de lib/types.ts en el frontend."""
+
+    id = serializers.CharField(source='pk', read_only=True)
+    startsAt = serializers.DateTimeField(source='starts_at', read_only=True)
+    coverImageUrl = serializers.SerializerMethodField()
+    externalUrl = serializers.URLField(source='external_url', read_only=True)
+
+    class Meta:
+        model = Event
+        fields = ['id', 'slug', 'title', 'description', 'startsAt', 'location', 'coverImageUrl', 'externalUrl']
+
+    def get_coverImageUrl(self, obj):
+        return _absolute_file_url(obj.cover_image, self.context)
+
+
+class EventAdminSerializer(EventSerializer):
+    """Misma forma que el público pero escribible, y con `status` — que el
+    endpoint público no expone porque solo devuelve publicados.
+
+    coverImage es write-only y llega como multipart/form-data, igual que en
+    ArticleAdminSerializer; la lectura sigue siendo coverImageUrl absoluta.
+    """
+
+    startsAt = serializers.DateTimeField(source='starts_at')
+    externalUrl = serializers.URLField(source='external_url', required=False, allow_blank=True)
+    coverImage = serializers.ImageField(source='cover_image', write_only=True, required=False, allow_null=True)
+    slug = serializers.SlugField(read_only=True)
+
+    class Meta(EventSerializer.Meta):
+        fields = EventSerializer.Meta.fields + ['status', 'coverImage']

@@ -5,8 +5,15 @@ from rest_framework.generics import get_object_or_404
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Article, Author, Category, Region, Tag
-from .serializers import ArticleAdminSerializer, AuthorAdminSerializer, CategoryAdminSerializer, RegionSerializer, TagSerializer
+from .models import Article, Author, Category, Event, Region, Tag
+from .serializers import (
+    ArticleAdminSerializer,
+    AuthorAdminSerializer,
+    CategoryAdminSerializer,
+    EventAdminSerializer,
+    RegionSerializer,
+    TagSerializer,
+)
 
 
 def _admin_article_queryset():
@@ -166,3 +173,28 @@ class AdminCategoryUpdateView(generics.RetrieveUpdateAPIView):
     permission_classes = [permissions.IsAdminUser]
     queryset = Category.objects.all()
     lookup_field = 'slug'
+
+
+class AdminEventListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/admin/events/ — la agenda completa (incluye borradores,
+    a diferencia del endpoint público) y la creación de eventos desde la
+    sección "Eventos" del panel. Acepta multipart/form-data cuando se sube
+    `coverImage`."""
+
+    serializer_class = EventAdminSerializer
+    permission_classes = [permissions.IsAdminUser]
+    pagination_class = None
+    queryset = Event.objects.all()
+
+
+class AdminEventDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE /api/admin/events/<id>/.
+
+    El borrado es directo, sin papelera: un evento no tiene el peso
+    editorial de un artículo (no tiene cuerpo, autor ni historial), así que
+    no se justifica el estado `trashed` intermedio que sí tiene Article.
+    """
+
+    serializer_class = EventAdminSerializer
+    permission_classes = [permissions.IsAdminUser]
+    queryset = Event.objects.all()

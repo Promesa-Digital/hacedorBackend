@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Article, Author, Category, NewsletterSubscriber, Region, Tag, Volume
+from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag, Volume
 
 
 @admin.register(Region)
@@ -32,6 +32,14 @@ class TagAdmin(admin.ModelAdmin):
 class VolumeAdmin(admin.ModelAdmin):
     list_display = ('code', 'title', 'author')
     search_fields = ('title', 'code')
+
+
+@admin.register(Event)
+class EventAdmin(admin.ModelAdmin):
+    list_display = ('title', 'starts_at', 'location', 'status')
+    list_filter = ('status',)
+    search_fields = ('title', 'location')
+    prepopulated_fields = {'slug': ('title',)}
 
 
 @admin.register(Article)

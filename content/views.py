@@ -6,12 +6,13 @@ from rest_framework.views import APIView
 from rest_framework.throttling import ScopedRateThrottle
 from django.utils import timezone
 
-from .models import Article, Author, Category, NewsletterSubscriber, Region, Tag, Volume
+from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag, Volume
 from .serializers import (
     ArticleDetailSerializer,
     ArticleListSerializer,
     AuthorSerializer,
     CategorySerializer,
+    EventSerializer,
     NewsletterSubscriberSerializer,
     RegionSerializer,
     TagSerializer,
@@ -211,3 +212,17 @@ class NewsletterSubscribeView(APIView):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'newsletter'
+
+
+class EventListView(generics.ListAPIView):
+    """GET /api/events/ — agenda pública, equivalente a getEvents().
+
+    Solo devuelve publicados; los borradores quedan para el panel. El orden
+    es `-starts_at` (heredado del Meta del modelo), así que el frontend
+    recibe primero lo más cercano en el futuro y separa próximos de pasados
+    comparando contra la fecha actual.
+    """
+
+    serializer_class = EventSerializer
+    queryset = Event.objects.filter(status='published')
+    pagination_class = None

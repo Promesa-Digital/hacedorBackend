@@ -140,6 +140,46 @@ class Volume(models.Model):
         return f'{self.code} — {self.title}'
 
 
+class Event(models.Model):
+    """Evento de la agenda pública (presentación, conversatorio, taller).
+
+    A diferencia de Article, no es una pieza editorial: no tiene autor,
+    categoría ni etiquetas — lo que importa es cuándo y dónde. `starts_at`
+    es el eje: el frontend separa próximos de pasados comparándolo contra
+    la fecha actual, así que un evento nunca se "vence" ni hay que borrarlo
+    a mano cuando pasa.
+
+    `status` funciona igual que en Article pero con solo dos estados: el
+    panel puede dejar un evento armado en `draft` hasta confirmarlo, y el
+    endpoint público solo devuelve los `published`.
+    """
+
+    STATUS_CHOICES = [
+        ('published', 'Publicado'),
+        ('draft', 'Borrador'),
+    ]
+
+    slug = models.SlugField(unique=True, blank=True)
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    starts_at = models.DateTimeField(help_text='Fecha y hora de inicio del evento.')
+    location = models.CharField(max_length=255, blank=True, help_text='Ej. "Biblioteca Municipal, Arequipa" o "Transmisión por Zoom".')
+    cover_image = models.ImageField(upload_to='events/', blank=True, null=True)
+    external_url = models.URLField(blank=True, help_text='Inscripción o más información. Opcional.')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+
+    class Meta:
+        ordering = ['-starts_at']
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = _unique_slug(type(self), self.title, self.pk)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.title} ({self.starts_at:%d/%m/%Y})'
+
+
 class NewsletterSubscriber(models.Model):
     """Correo suscrito desde el formulario de newsletter del sitio público
     (`Newsletter.astro` → `POST /api/newsletter/`). Sin envío de campañas
