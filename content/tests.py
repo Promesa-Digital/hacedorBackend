@@ -1,4 +1,5 @@
 import io
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -8,6 +9,7 @@ from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from .admin_views import AdminInlineImageUploadView
 from .embeds import normalize_spotify_embed_url, normalize_youtube_embed_url
 from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag
 
@@ -540,3 +542,67 @@ class EventAdminTests(AdminAPITestCase):
         res = self.client.delete(f'/api/admin/events/{event.id}/')
         self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Event.objects.filter(pk=event.pk).exists())
+
+
+class InlineImageUploadTests(AdminAPITestCase):
+    """POST /api/admin/media/ — imágenes que van DENTRO del cuerpo del artículo.
+
+    Este endpoint recibe archivos arbitrarios de quien edita y devuelve una URL
+    que después se publica en el sitio, así que los casos de abajo no son
+    decoración: cada uno tapa una forma conocida de convertir una subida en
+    ejecución de código en el navegador de quien lee.
+    """
+
+    URL = '/api/admin/media/'
+
+    def test_requires_authentication(self):
+        self.client.credentials()
+        res = self.client.post(self.URL, {'file': make_image_file(10, 10)}, format='multipart')
+        self.assertIn(res.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_uploads_image_and_returns_absolute_url(self):
+        res = self.client.post(self.URL, {'file': make_image_file(40, 30)}, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(res.data['url'].startswith('http'))
+        self.assertIn('/media/inline/', res.data['url'])
+
+    def test_rejects_missing_file(self):
+        res = self.client.post(self.URL, {}, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_svg_because_it_can_carry_scripts(self):
+        svg = SimpleUploadedFile(
+            'malicioso.svg',
+            b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+            content_type='image/svg+xml',
+        )
+        res = self.client.post(self.URL, {'file': svg}, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_file_that_only_pretends_to_be_an_image(self):
+        """El content-type lo elige el cliente y se puede mentir; lo que manda
+        es que Pillow pueda abrir el archivo de verdad."""
+        fake = SimpleUploadedFile('trampa.jpg', b'<?php system($_GET["c"]); ?>', content_type='image/jpeg')
+        res = self.client.post(self.URL, {'file': fake}, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejects_file_over_the_size_limit(self):
+        """Se baja el tope en vez de fabricar un archivo de 6 MB: pisarle `.size`
+        al SimpleUploadedFile no sirve, porque Django rearma el objeto al parsear
+        el multipart y vuelve a medir el archivo real."""
+        with patch.object(AdminInlineImageUploadView, 'MAX_BYTES', 100):
+            res = self.client.post(self.URL, {'file': make_image_file(40, 30)}, format='multipart')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('MB', str(res.data))
+
+    def test_ignores_the_filename_sent_by_the_client(self):
+        """Un nombre venido de afuera puede traer barras o '..' para escribir
+        fuera de MEDIA_ROOT. El nombre lo decide el servidor."""
+        res = self.client.post(
+            self.URL,
+            {'file': make_image_file(10, 10, name='../../../etc/passwd.jpg')},
+            format='multipart',
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertNotIn('..', res.data['url'])
+        self.assertNotIn('passwd', res.data['url'])

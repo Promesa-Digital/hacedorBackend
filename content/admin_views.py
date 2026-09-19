@@ -1,7 +1,9 @@
+from django.core.files.storage import default_storage
 from django.db.models import ProtectedError
 from rest_framework import generics, permissions, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.generics import get_object_or_404
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -198,3 +200,70 @@ class AdminEventDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = EventAdminSerializer
     permission_classes = [permissions.IsAdminUser]
     queryset = Event.objects.all()
+
+
+class AdminInlineImageUploadView(APIView):
+    """POST /api/admin/media/ — sube una imagen para insertarla DENTRO del
+    cuerpo de un artículo, y devuelve su URL absoluta.
+
+    Es distinto de la portada: la portada es un campo del propio Article
+    (`coverImage`), mientras que estas imágenes no pertenecen a ninguna fila —
+    viven sueltas en disco y el artículo solo las referencia por URL desde su
+    markdown. Por eso no hay modelo detrás: crear uno obligaría a limpiar filas
+    huérfanas cada vez que alguien borra una imagen del texto.
+
+    Contrapartida asumida: si se quita la imagen del artículo, el archivo queda
+    en disco. Es basura barata y recuperable; una fila huérfana apuntando a un
+    archivo que ya no existe sería peor.
+    """
+
+    permission_classes = [permissions.IsAdminUser]
+    parser_classes = [MultiPartParser, FormParser]
+
+    # Solo formatos que un navegador muestra como imagen. SVG queda afuera a
+    # propósito: es XML y puede traer <script> adentro, así que subirlo sería
+    # abrir un XSS por la puerta de atrás justo en el sitio público.
+    ALLOWED_CONTENT_TYPES = {
+        'image/jpeg': '.jpg',
+        'image/png': '.png',
+        'image/webp': '.webp',
+        'image/gif': '.gif',
+    }
+    MAX_BYTES = 5 * 1024 * 1024
+
+    def post(self, request):
+        upload = request.FILES.get('file')
+        if not upload:
+            raise ValidationError({'file': 'Falta el archivo.'})
+
+        if upload.size > self.MAX_BYTES:
+            raise ValidationError(
+                {'file': f'La imagen pesa más de {self.MAX_BYTES // (1024 * 1024)} MB.'}
+            )
+
+        extension = self.ALLOWED_CONTENT_TYPES.get(upload.content_type)
+        if extension is None:
+            raise ValidationError({'file': 'Formato no admitido. Se aceptan JPG, PNG, WebP y GIF.'})
+
+        # Se verifica que el archivo SEA una imagen, no que lo diga su
+        # content-type: ese lo elige el cliente y se puede mentir. Pillow lo
+        # abre de verdad; si no es una imagen, revienta acá y no en el sitio.
+        from PIL import Image, UnidentifiedImageError
+
+        try:
+            Image.open(upload).verify()
+        except (UnidentifiedImageError, OSError):
+            raise ValidationError({'file': 'El archivo no es una imagen válida.'})
+        finally:
+            upload.seek(0)
+
+        # El nombre lo pone el servidor, no el cliente: un nombre de archivo
+        # llegado de afuera puede traer barras o ".." e intentar escribir fuera
+        # de MEDIA_ROOT. `default_storage.save` además desambigua colisiones.
+        import uuid
+
+        stored = default_storage.save(f'inline/{uuid.uuid4().hex}{extension}', upload)
+        return Response(
+            {'url': request.build_absolute_uri(default_storage.url(stored))},
+            status=status.HTTP_201_CREATED,
+        )

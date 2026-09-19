@@ -15,6 +15,7 @@ urlpatterns = [
     path('regions/<int:pk>/', admin_views.AdminRegionDeleteView.as_view(), name='admin-region-delete'),
     path('events/', admin_views.AdminEventListCreateView.as_view(), name='admin-event-list'),
     path('events/<int:pk>/', admin_views.AdminEventDetailView.as_view(), name='admin-event-detail'),
+    path('media/', admin_views.AdminInlineImageUploadView.as_view(), name='admin-inline-image'),
     path('categories/', admin_views.AdminCategoryListView.as_view(), name='admin-category-list'),
     path('categories/<slug:slug>/', admin_views.AdminCategoryUpdateView.as_view(), name='admin-category-update'),
 ]
