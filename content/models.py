@@ -1,6 +1,8 @@
 from django.db import models
 from django.utils.text import slugify
-from PIL import Image
+from PIL import Image, ImageOps
+
+from .images import optimizar_imagen
 
 from .embeds import normalize_spotify_embed_url, normalize_youtube_embed_url
 
@@ -50,6 +52,11 @@ class Author(models.Model):
 
     class Meta:
         ordering = ['name']
+
+    def save(self, *args, **kwargs):
+        if self.avatar:
+            optimizar_imagen(self.avatar)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -136,6 +143,11 @@ class Volume(models.Model):
     class Meta:
         ordering = ['-id']
 
+    def save(self, *args, **kwargs):
+        if self.cover_image:
+            optimizar_imagen(self.cover_image)
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f'{self.code} — {self.title}'
 
@@ -174,6 +186,8 @@ class Event(models.Model):
     def save(self, *args, **kwargs):
         if not self.slug:
             self.slug = _unique_slug(type(self), self.title, self.pk)
+        if self.cover_image:
+            optimizar_imagen(self.cover_image)
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -259,6 +273,9 @@ class Article(models.Model):
         self.youtube_embed_url = normalize_youtube_embed_url(self.youtube_embed_url)
         self.spotify_embed_url = normalize_spotify_embed_url(self.spotify_embed_url)
         if self.cover_image:
+            # Achica y reencoda antes de medir: una foto de celular sin tocar
+            # son varios MB que viajan enteros a cada lector.
+            optimizar_imagen(self.cover_image)
             # Se recalcula en cada save (no solo cuando llega un archivo
             # nuevo) porque cover_image sigue apuntando al mismo archivo en
             # disco en un PATCH sin coverImage — reabrirlo es barato y evita
@@ -267,7 +284,12 @@ class Article(models.Model):
             try:
                 self.cover_image.open()
                 with Image.open(self.cover_image) as img:
-                    width, height = img.size
+                    # `exif_transpose` y no `img.size` a secas: un celular
+                    # guarda las fotos verticales en horizontal más una marca
+                    # EXIF que dice "rotar 90". El navegador la respeta, así
+                    # que sin esto un retrato se medía como apaisado y
+                    # terminaba recortado a 21:9.
+                    width, height = ImageOps.exif_transpose(img).size
                 if width > height:
                     self.cover_image_orientation = 'landscape'
                 elif height > width:

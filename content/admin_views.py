@@ -1,4 +1,5 @@
 from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
 from django.db.models import ProtectedError
 from rest_framework import generics, permissions, status
 from rest_framework.exceptions import ValidationError
@@ -7,6 +8,7 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .images import EXTENSIONES, optimizar_bytes
 from .models import Article, Author, Category, Event, Region, Tag
 from .serializers import (
     ArticleAdminSerializer,
@@ -262,7 +264,19 @@ class AdminInlineImageUploadView(APIView):
         # de MEDIA_ROOT. `default_storage.save` además desambigua colisiones.
         import uuid
 
-        stored = default_storage.save(f'inline/{uuid.uuid4().hex}{extension}', upload)
+        # Se achica y reencoda antes de guardar. Estas imágenes se muestran
+        # como mucho a 680 px, así que 1600 ya cubre pantallas de alta
+        # densidad: subir la foto original sería mandarle megabytes de más a
+        # cada lector para mostrarlos a la cuarta parte del tamaño.
+        contenido = upload
+        optimizada = optimizar_bytes(upload.read(), max_side=1600)
+        upload.seek(0)
+        if optimizada is not None:
+            datos, destino = optimizada
+            contenido = ContentFile(datos)
+            extension = EXTENSIONES[destino]
+
+        stored = default_storage.save(f'inline/{uuid.uuid4().hex}{extension}', contenido)
         return Response(
             {'url': request.build_absolute_uri(default_storage.url(stored))},
             status=status.HTTP_201_CREATED,

@@ -9,7 +9,11 @@ from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+
 from .admin_views import AdminInlineImageUploadView
+from .images import optimizar_bytes, optimizar_imagen
 from .embeds import normalize_spotify_embed_url, normalize_youtube_embed_url
 from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag
 
@@ -670,3 +674,176 @@ class MediaRangeRequestTests(APITestCase):
     def test_sigue_sin_poder_salir_de_media_root(self):
         res = self.client.get('/media/..%2fconfig/settings.py')
         self.assertIn(res.status_code, (400, 404))
+
+
+def _imagen_bytes(ancho, alto, formato='JPEG', exif_orientacion=None, modo='RGB'):
+    """Genera una imagen de prueba con ruido, para que comprima como una foto
+    real y no como un rectángulo de color plano (que pesaría casi nada y haría
+    pasar los tests de peso por el motivo equivocado)."""
+    import random
+
+    random.seed(ancho * alto)
+    imagen = Image.new(modo, (ancho, alto))
+    canales = len(imagen.getbands())
+    if canales == 1:
+        imagen.putdata([random.randrange(256) for _ in range(ancho * alto)])
+    else:
+        imagen.putdata([tuple(random.randrange(256) for _ in range(canales)) for _ in range(ancho * alto)])
+
+    guardado = {}
+    if exif_orientacion is not None:
+        exif = imagen.getexif()
+        exif[274] = exif_orientacion
+        guardado['exif'] = exif
+    buffer = io.BytesIO()
+    imagen.save(buffer, formato, **guardado)
+    return buffer.getvalue()
+
+
+class OptimizarImagenTests(SimpleTestCase):
+    """La optimización corre en cada save(), así que además de achicar tiene
+    que ser idempotente: si volviera a reencodar una imagen ya procesada, cada
+    edición del artículo degradaría un poco más la portada."""
+
+    def test_achica_hasta_el_lado_mayor(self):
+        datos = _imagen_bytes(4000, 3000)
+        resultado = optimizar_bytes(datos)
+
+        self.assertIsNotNone(resultado)
+        nuevos, formato = resultado
+        self.assertEqual(formato, 'WEBP')
+        self.assertEqual(Image.open(io.BytesIO(nuevos)).size, (2400, 1800))
+        self.assertLess(len(nuevos), len(datos))
+
+    def test_no_agranda_una_imagen_chica(self):
+        datos = _imagen_bytes(800, 600)
+        resultado = optimizar_bytes(datos)
+
+        if resultado is not None:
+            nuevos, _ = resultado
+            self.assertEqual(Image.open(io.BytesIO(nuevos)).size, (800, 600))
+            self.assertLessEqual(len(nuevos), len(datos))
+
+    def test_es_idempotente(self):
+        primera, _ = optimizar_bytes(_imagen_bytes(4000, 3000))
+        self.assertIsNone(optimizar_bytes(primera))
+
+    def test_aplica_la_rotacion_exif(self):
+        # Una foto vertical de celular: se guarda apaisada más la marca 6
+        # ("rotar 90"). El navegador la muestra vertical, así que el archivo
+        # tiene que quedar vertical de verdad.
+        datos = _imagen_bytes(4000, 3000, exif_orientacion=6)
+        nuevos, _ = optimizar_bytes(datos)
+
+        ancho, alto = Image.open(io.BytesIO(nuevos)).size
+        self.assertGreater(alto, ancho)
+
+    def test_conserva_la_transparencia(self):
+        datos = _imagen_bytes(3000, 3000, formato='PNG', modo='RGBA')
+        nuevos, formato = optimizar_bytes(datos)
+
+        self.assertEqual(formato, 'WEBP')
+        self.assertIn(Image.open(io.BytesIO(nuevos)).mode, ('RGBA', 'LA', 'P'))
+
+    def test_ignora_el_gif(self):
+        # Puede estar animado y reencodarlo perdería el movimiento.
+        self.assertIsNone(optimizar_bytes(_imagen_bytes(3000, 3000, formato='GIF', modo='P')))
+
+    def test_no_revienta_con_basura(self):
+        self.assertIsNone(optimizar_bytes(b'esto no es una imagen'))
+
+
+class ArticleCoverOptimizationTests(AdminAPITestCase):
+    def test_la_portada_se_achica_al_guardar(self):
+        article = Article.objects.create(
+            title='Con portada pesada',
+            body='cuerpo',
+            category=self.category,
+            author=self.author,
+            published_at=timezone.now(),
+            cover_image=SimpleUploadedFile('foto.jpg', _imagen_bytes(4000, 3000), content_type='image/jpeg'),
+        )
+
+        article.refresh_from_db()
+        with Image.open(article.cover_image) as img:
+            self.assertEqual(max(img.size), 2400)
+
+    def test_una_foto_vertical_de_celular_no_queda_como_apaisada(self):
+        """El bug: un celular guarda el retrato apaisado más una marca EXIF de
+        rotación. El navegador la respeta y muestra la foto vertical, pero el
+        cálculo leía `img.size` crudo, la clasificaba 'landscape' y el sitio la
+        recortaba a 21:9."""
+        article = Article.objects.create(
+            title='Retrato de celular',
+            body='cuerpo',
+            category=self.category,
+            author=self.author,
+            published_at=timezone.now(),
+            cover_image=SimpleUploadedFile(
+                'retrato.jpg', _imagen_bytes(4000, 3000, exif_orientacion=6), content_type='image/jpeg'
+            ),
+        )
+
+        article.refresh_from_db()
+        self.assertEqual(article.cover_image_orientation, 'portrait')
+
+    def test_reguardar_no_vuelve_a_reencodar(self):
+        article = Article.objects.create(
+            title='Reguardado',
+            body='cuerpo',
+            category=self.category,
+            author=self.author,
+            published_at=timezone.now(),
+            cover_image=SimpleUploadedFile('foto.jpg', _imagen_bytes(4000, 3000), content_type='image/jpeg'),
+        )
+        article.refresh_from_db()
+        nombre, peso = article.cover_image.name, article.cover_image.size
+
+        article.title = 'Reguardado otra vez'
+        article.save()
+
+        article.refresh_from_db()
+        self.assertEqual(article.cover_image.name, nombre)
+        self.assertEqual(article.cover_image.size, peso)
+
+
+class InlineImageOptimizationTests(AdminAPITestCase):
+    def test_la_imagen_del_cuerpo_se_achica(self):
+        response = self.client.post(
+            '/api/admin/media/',
+            {'file': SimpleUploadedFile('grande.jpg', _imagen_bytes(2400, 1800), content_type='image/jpeg')},
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        ruta = response.data['url'].split('/media/', 1)[1]
+        with default_storage.open(f'{ruta}') as archivo:
+            with Image.open(archivo) as img:
+                self.assertEqual(max(img.size), 1600)
+
+
+class OptimizarImagenGuardadaTests(AdminAPITestCase):
+    """Las imágenes que ya estaban en disco antes de que existiera la
+    optimización se procesan por el comando `optimizar_imagenes`, y ahí el
+    campo ya tiene la ruta completa — no el nombre suelto que llega en una
+    subida nueva."""
+
+    def test_no_duplica_la_carpeta_al_renombrar(self):
+        # El bug: `FieldFile.save()` vuelve a aplicar `upload_to`, así que
+        # pasarle 'articles/foto.webp' daba 'articles/articles/foto.webp'.
+        ruta = default_storage.save('articles/vieja.jpg', ContentFile(_imagen_bytes(4000, 3000)))
+        article = Article.objects.create(
+            title='Ya estaba en disco',
+            body='cuerpo',
+            category=self.category,
+            author=self.author,
+            published_at=timezone.now(),
+        )
+        Article.objects.filter(pk=article.pk).update(cover_image=ruta)
+        article.refresh_from_db()
+
+        self.assertTrue(optimizar_imagen(article.cover_image))
+
+        self.assertEqual(article.cover_image.name, 'articles/vieja.webp')
+        default_storage.delete(ruta)
+        article.cover_image.delete(save=False)
