@@ -606,3 +606,67 @@ class InlineImageUploadTests(AdminAPITestCase):
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
         self.assertNotIn('..', res.data['url'])
         self.assertNotIn('passwd', res.data['url'])
+
+
+class MediaRangeRequestTests(APITestCase):
+    """Entrega de archivos subidos por tramos (HTTP Range).
+
+    Django 6 no implementa Range en ninguna parte, así que devolvía siempre el
+    archivo entero: un reproductor de audio adelanta pidiendo un tramo de bytes,
+    y al recibir todo desde el principio la barra de progreso no se podía mover.
+    Estos casos fijan que el tramo se respete y que los bytes sean los correctos.
+    """
+
+    def setUp(self):
+        from django.conf import settings
+
+        self.contenido = bytes(range(256)) * 40  # 10240 bytes reconocibles
+        self.carpeta = settings.MEDIA_ROOT / 'inline'
+        self.carpeta.mkdir(parents=True, exist_ok=True)
+        self.archivo = self.carpeta / 'rango-de-prueba.bin'
+        self.archivo.write_bytes(self.contenido)
+        self.url = '/media/inline/rango-de-prueba.bin'
+
+    def tearDown(self):
+        self.archivo.unlink(missing_ok=True)
+
+    def test_anuncia_que_acepta_tramos(self):
+        """Sin este encabezado el navegador ni intenta adelantar."""
+        res = self.client.get(self.url)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers['Accept-Ranges'], 'bytes')
+
+    def test_devuelve_el_tramo_pedido(self):
+        res = self.client.get(self.url, headers={'range': 'bytes=1000-1999'})
+        self.assertEqual(res.status_code, 206)
+        self.assertEqual(res.headers['Content-Range'], f'bytes 1000-1999/{len(self.contenido)}')
+        self.assertEqual(b''.join(res.streaming_content), self.contenido[1000:2000])
+
+    def test_tramo_abierto_llega_hasta_el_final(self):
+        res = self.client.get(self.url, headers={'range': 'bytes=10000-'})
+        self.assertEqual(res.status_code, 206)
+        self.assertEqual(b''.join(res.streaming_content), self.contenido[10000:])
+
+    def test_tramo_por_el_final(self):
+        res = self.client.get(self.url, headers={'range': 'bytes=-100'})
+        self.assertEqual(res.status_code, 206)
+        self.assertEqual(b''.join(res.streaming_content), self.contenido[-100:])
+
+    def test_tramo_imposible_responde_416(self):
+        res = self.client.get(self.url, headers={'range': 'bytes=999999-'})
+        self.assertEqual(res.status_code, 416)
+        self.assertEqual(res.headers['Content-Range'], f'bytes */{len(self.contenido)}')
+
+    def test_un_range_ilegible_devuelve_el_archivo_entero(self):
+        """Mejor mandar todo —que es una respuesta válida— que fallar."""
+        res = self.client.get(self.url, headers={'range': 'paginas=1-2'})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(b''.join(res.streaming_content), self.contenido)
+
+    def test_sin_range_el_archivo_llega_completo(self):
+        res = self.client.get(self.url)
+        self.assertEqual(b''.join(res.streaming_content), self.contenido)
+
+    def test_sigue_sin_poder_salir_de_media_root(self):
+        res = self.client.get('/media/..%2fconfig/settings.py')
+        self.assertIn(res.status_code, (400, 404))

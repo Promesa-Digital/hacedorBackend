@@ -1,7 +1,8 @@
 from django.conf import settings
 from django.contrib import admin
 from django.urls import include, path, re_path
-from django.views.static import serve
+
+from .media_views import serve_media
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -23,6 +24,9 @@ urlpatterns = [
 # no es la solución definitiva: lo correcto a futuro es un almacenamiento de
 # objetos (S3, R2, Spaces) o que nginx sirva el volumen directamente. Para el
 # tamaño de esta revista alcanza, y es mejor que no verse.
+# `serve_media` agrega soporte de peticiones por tramo (HTTP Range) sobre el
+# `serve` de Django, que no lo trae: sin eso la narración de los artículos no se
+# puede adelantar ni retroceder (ver config/media_views.py).
 urlpatterns += [
-    re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
+    re_path(r'^media/(?P<path>.*)$', serve_media),
 ]
