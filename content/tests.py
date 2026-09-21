@@ -2,6 +2,7 @@ import io
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase
 from django.utils import timezone
@@ -15,7 +16,7 @@ from django.core.files.storage import default_storage
 from .admin_views import AdminInlineImageUploadView
 from .images import optimizar_bytes, optimizar_imagen
 from .embeds import normalize_spotify_embed_url, normalize_youtube_embed_url
-from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag
+from .models import Article, Author, Category, Event, LibraryPiece, NewsletterSubscriber, Region, Tag
 
 
 class EmbedNormalizationTests(SimpleTestCase):
@@ -61,6 +62,13 @@ class AdminAPITestCase(APITestCase):
     """Base con un usuario admin autenticado vía Bearer y taxonomía mínima."""
 
     def setUp(self):
+        # El limitador de tasa del login (60/minuto) cuenta en la caché, que en
+        # las pruebas es de proceso y sobrevive de un test al siguiente. Cada
+        # prueba de admin hace su login acá, así que pasadas las 60 el resto de
+        # la suite fallaba con un KeyError: 'token' desconcertante — el login
+        # devolvía 429 y nadie lo miraba. Limpiarla deja cada prueba
+        # independiente del orden y de cuántas haya.
+        cache.clear()
         User.objects.create_user(username='editor', email='editor@elhacedor.pe', password='clave-segura', is_staff=True)
         login = self.client.post('/api/admin/login/', {'email': 'editor@elhacedor.pe', 'password': 'clave-segura'}, format='json')
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {login.data["token"]}')
@@ -847,3 +855,201 @@ class OptimizarImagenGuardadaTests(AdminAPITestCase):
         self.assertEqual(article.cover_image.name, 'articles/vieja.webp')
         default_storage.delete(ruta)
         article.cover_image.delete(save=False)
+
+
+class LibraryPieceModelTests(AdminAPITestCase):
+    """La Biblioteca guarda obra ajena: lo que se prueba acá es que el orden sea
+    alfabético (el índice público es A-Z, no una línea de tiempo) y que borrar
+    gente no se lleve puesta la obra."""
+
+    def _pieza(self, **extra):
+        datos = {'title': 'Masa', 'author': self.author, 'genre': 'poema', 'body': 'verso'}
+        datos.update(extra)
+        return LibraryPiece.objects.create(**datos)
+
+    def test_genera_el_slug(self):
+        self.assertEqual(self._pieza().slug, 'masa')
+
+    def test_el_slug_no_choca(self):
+        self._pieza()
+        self.assertEqual(self._pieza().slug, 'masa-2')
+
+    def test_ordena_alfabeticamente_no_por_fecha(self):
+        # Si el orden fuera por id, "Trilce" iría primero solo por haberse
+        # cargado antes, y el índice A-Z saldría desordenado.
+        self._pieza(title='Trilce')
+        self._pieza(title='Masa')
+        self.assertEqual([p.title for p in LibraryPiece.objects.all()], ['Masa', 'Trilce'])
+
+    def test_borrar_al_narrador_no_borra_la_pieza(self):
+        narrador = Author.objects.create(name='Bruno Odar')
+        pieza = self._pieza(narrator=narrador)
+        narrador.delete()
+        pieza.refresh_from_db()
+        self.assertIsNone(pieza.narrator)
+
+    def test_no_deja_borrar_al_autor_con_piezas(self):
+        # Al revés que con el narrador: una obra sin autor no es nada.
+        from django.db.models import ProtectedError
+
+        self._pieza()
+        with self.assertRaises(ProtectedError):
+            self.author.delete()
+
+    def test_optimiza_la_portada(self):
+        pieza = self._pieza(
+            cover_image=SimpleUploadedFile('tapa.jpg', _imagen_bytes(4000, 3000), content_type='image/jpeg')
+        )
+        pieza.refresh_from_db()
+        with Image.open(pieza.cover_image) as img:
+            self.assertEqual(max(img.size), 2400)
+
+    def test_al_publicar_se_sella_la_fecha(self):
+        self.assertIsNotNone(self._pieza(status='published').published_at)
+
+    def test_un_borrador_no_tiene_fecha(self):
+        self.assertIsNone(self._pieza().published_at)
+
+
+class LibraryPublicAPITests(APITestCase):
+    def setUp(self):
+        self.region = Region.objects.create(name='Arequipa', code='040')
+        self.author = Author.objects.create(name='César Vallejo', region=self.region)
+        self.narrator = Author.objects.create(name='Bruno Odar')
+        LibraryPiece.objects.create(
+            title='Masa', author=self.author, narrator=self.narrator,
+            genre='poema', body='verso', status='published',
+        )
+        LibraryPiece.objects.create(title='Paco Yunque', author=self.author, genre='cuento', status='published')
+        LibraryPiece.objects.create(title='Sin publicar', author=self.author, genre='poema', status='draft')
+
+    def test_solo_devuelve_publicadas(self):
+        response = self.client.get('/api/library/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual({p['title'] for p in response.data}, {'Masa', 'Paco Yunque'})
+
+    def test_viene_ordenado_alfabeticamente(self):
+        self.assertEqual([p['title'] for p in self.client.get('/api/library/').data], ['Masa', 'Paco Yunque'])
+
+    def test_filtra_por_genero(self):
+        self.assertEqual([p['title'] for p in self.client.get('/api/library/?genre=cuento').data], ['Paco Yunque'])
+
+    def test_un_genero_que_no_existe_no_revienta(self):
+        # El filtro llega de un parámetro de URL que cualquiera puede escribir
+        # a mano: devuelve vacío, no un 400.
+        self.assertEqual(list(self.client.get('/api/library/?genre=haiku').data), [])
+
+    def test_trae_autor_y_narrador_anidados(self):
+        pieza = next(p for p in self.client.get('/api/library/').data if p['title'] == 'Masa')
+        self.assertEqual(pieza['author']['name'], 'César Vallejo')
+        self.assertEqual(pieza['narrator']['name'], 'Bruno Odar')
+
+    def test_sin_narrador_devuelve_null(self):
+        pieza = next(p for p in self.client.get('/api/library/').data if p['title'] == 'Paco Yunque')
+        self.assertIsNone(pieza['narrator'])
+
+    def test_detalle_por_slug(self):
+        response = self.client.get('/api/library/masa/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['body'], 'verso')
+
+    def test_el_detalle_de_un_borrador_da_404(self):
+        self.assertEqual(self.client.get('/api/library/sin-publicar/').status_code, status.HTTP_404_NOT_FOUND)
+
+
+class LibraryAdminTests(AdminAPITestCase):
+    def _crear(self, **extra):
+        datos = {'title': 'Masa', 'author': self.author.pk, 'genre': 'poema', 'body': 'verso'}
+        datos.update(extra)
+        return self.client.post('/api/admin/library/', datos, format='multipart')
+
+    def test_crea_una_pieza(self):
+        response = self._crear()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['slug'], 'masa')
+
+    def test_el_listado_incluye_borradores(self):
+        self._crear()
+        self.assertEqual(len(self.client.get('/api/admin/library/').data), 1)
+
+    def test_asigna_narrador(self):
+        narrador = Author.objects.create(name='Bruno Odar')
+        self.assertEqual(self._crear(narrator=narrador.pk).data['narrator']['name'], 'Bruno Odar')
+
+    def test_sube_audio(self):
+        # El campo tiene que estar en Meta.fields o DRF lo ignora en silencio
+        # y la narración nunca llega al modelo.
+        audio = SimpleUploadedFile('lectura.mp3', b'ID3\x04\x00' + b'\x00' * 200, content_type='audio/mpeg')
+        pk = self._crear(audio=audio).data['id']
+        self.assertTrue(LibraryPiece.objects.get(pk=pk).audio)
+
+    def test_publica_con_patch(self):
+        pk = self._crear().data['id']
+        response = self.client.patch(f'/api/admin/library/{pk}/', {'status': 'published'}, format='multipart')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(LibraryPiece.objects.get(pk=pk).status, 'published')
+
+    def test_no_borra_si_no_esta_en_papelera(self):
+        # Mismo criterio que Article: el borrado definitivo siempre pasa antes
+        # por la papelera, para que no esté a un clic del listado activo.
+        pk = self._crear().data['id']
+        self.assertEqual(self.client.delete(f'/api/admin/library/{pk}/').status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(LibraryPiece.objects.filter(pk=pk).exists())
+
+    def test_borra_si_esta_en_papelera(self):
+        pk = self._crear(status='trashed').data['id']
+        self.assertEqual(self.client.delete(f'/api/admin/library/{pk}/').status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(LibraryPiece.objects.filter(pk=pk).exists())
+
+    def test_sin_sesion_no_se_puede(self):
+        self.client.credentials()
+        self.assertIn(self.client.get('/api/admin/library/').status_code, (401, 403))
+
+    def test_borrar_un_autor_con_piezas_da_400_con_mensaje(self):
+        # AdminAuthorDeleteView ya traduce ProtectedError a 400. Al sumar una FK
+        # PROTECT nueva desde LibraryPiece ese camino tiene que seguir andando:
+        # si no, borrar un autor tira un 500.
+        self._crear()
+        response = self.client.delete(f'/api/admin/authors/{self.author.pk}/')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Biblioteca', response.data['detail'])
+
+
+class NombreDeArchivoOptimizadoTests(AdminAPITestCase):
+    """El nombre nuevo se arma a partir del que manda el cliente, que puede ser
+    cualquier cosa: emojis, kanji, solo signos. Django le saca todo lo que no
+    sea ASCII al guardar, así que un nombre mal armado puede colapsar a solo la
+    extensión."""
+
+    def _subir(self, nombre_archivo):
+        pieza = LibraryPiece.objects.create(
+            title='Con portada', author=self.author, genre='poema',
+            cover_image=SimpleUploadedFile(nombre_archivo, _imagen_bytes(3000, 3000), content_type='image/jpeg'),
+        )
+        pieza.refresh_from_db()
+        return pieza.cover_image.name.split('/')[-1]
+
+    def test_un_nombre_de_solo_simbolos_no_deja_el_archivo_sin_nombre(self):
+        # Este es el caso real: una foto llamada "☆.jpeg" terminaba guardada
+        # como "library/.webp" — sin nombre, y chocando con cualquier otra
+        # igual de anónima.
+        nombre = self._subir('☆.jpeg')
+        self.assertNotEqual(nombre, '.webp')
+        self.assertTrue(nombre.endswith('.webp'))
+        self.assertGreater(len(nombre), len('.webp'))
+
+    def test_conserva_un_nombre_normal(self):
+        # startswith y no igualdad: si ya existe un retrato.webp en disco,
+        # Django le agrega un sufijo aleatorio. Eso es correcto y no es lo que
+        # se está probando acá.
+        nombre = self._subir('retrato.jpg')
+        self.assertTrue(nombre.startswith('retrato'), nombre)
+        self.assertTrue(nombre.endswith('.webp'), nombre)
+
+    def test_las_tildes_y_la_enhe_no_rompen_el_nombre(self):
+        nombre = self._subir('ñandú.jpg')
+        self.assertTrue(nombre.endswith('.webp'))
+        self.assertGreater(len(nombre), len('.webp'))
+
+    def test_dos_archivos_anonimos_no_se_pisan(self):
+        self.assertNotEqual(self._subir('☆.jpeg'), self._subir('★.jpeg'))

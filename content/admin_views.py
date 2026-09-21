@@ -9,12 +9,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .images import EXTENSIONES, optimizar_bytes
-from .models import Article, Author, Category, Event, Region, Tag
+from .models import Article, Author, Category, Event, LibraryPiece, Region, Tag
 from .serializers import (
     ArticleAdminSerializer,
     AuthorAdminSerializer,
     CategoryAdminSerializer,
     EventAdminSerializer,
+    LibraryAdminSerializer,
     RegionSerializer,
     TagSerializer,
 )
@@ -130,7 +131,7 @@ class AdminAuthorDeleteView(generics.DestroyAPIView):
             return super().destroy(request, *args, **kwargs)
         except ProtectedError:
             return Response(
-                {'detail': 'No se puede eliminar: este autor tiene publicaciones o volúmenes asociados.'},
+                {'detail': 'No se puede eliminar: este autor tiene publicaciones, volúmenes o piezas de la Biblioteca asociadas.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -281,3 +282,35 @@ class AdminInlineImageUploadView(APIView):
             {'url': request.build_absolute_uri(default_storage.url(stored))},
             status=status.HTTP_201_CREATED,
         )
+
+
+class AdminLibraryListCreateView(generics.ListCreateAPIView):
+    """GET/POST /api/admin/library/ — el catálogo completo (con borradores y
+    papelera, a diferencia del endpoint público) y la carga de piezas nuevas.
+    Acepta multipart/form-data: la portada y el audio entran en el mismo envío."""
+
+    serializer_class = LibraryAdminSerializer
+    permission_classes = [permissions.IsAdminUser]
+    parser_classes = [MultiPartParser, FormParser]
+    pagination_class = None
+    queryset = LibraryPiece.objects.select_related('author', 'narrator').all()
+
+
+class AdminLibraryDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE /api/admin/library/<id>/.
+
+    No hay endpoints de papelera/restaurar aparte: `status` es escribible, así
+    que mandar a la papelera es un PATCH más. DELETE sigue el criterio de
+    Article — solo se permite si la pieza ya está en `trashed`, para que el
+    borrado definitivo nunca quede a un clic del listado activo.
+    """
+
+    serializer_class = LibraryAdminSerializer
+    permission_classes = [permissions.IsAdminUser]
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = LibraryPiece.objects.select_related('author', 'narrator').all()
+
+    def perform_destroy(self, instance):
+        if instance.status != 'trashed':
+            raise ValidationError('Solo se puede eliminar definitivamente una pieza que ya está en la papelera.')
+        instance.delete()

@@ -11,11 +11,14 @@ python manage.py collectstatic --noinput
 # guardar ningún artículo (el FK category no existe). Idempotente.
 python manage.py shell -c "
 from content.models import Category
+# Los slug no coinciden con las etiquetas a propósito: son históricos y
+# renombrarlos obligaría a migrar el tipo CategorySlug del frontend, las
+# rutas y el parámetro ?category= de la API sin ganar nada visible.
 categories = [
-    {'slug': 'articulos', 'label': 'Artículos', 'color_variant': 'primary'},
+    {'slug': 'articulos', 'label': 'Crítica', 'color_variant': 'primary'},
     {'slug': 'entrevistas', 'label': 'Entrevistas', 'color_variant': 'secondary'},
-    {'slug': 'revistas', 'label': 'Revistas', 'color_variant': 'tertiary'},
-    {'slug': 'ensayos', 'label': 'Ensayos', 'color_variant': 'secondary'},
+    {'slug': 'revistas', 'label': 'Teoría', 'color_variant': 'tertiary'},
+    {'slug': 'ensayos', 'label': 'Ensayo y Crónica', 'color_variant': 'secondary'},
 ]
 for c in categories:
     Category.objects.get_or_create(slug=c['slug'], defaults=c)

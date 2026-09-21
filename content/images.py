@@ -22,9 +22,11 @@ tiene marca de rotación, se devuelve intacta. Por eso puede llamarse en cada
 """
 
 import io
-from pathlib import PurePosixPath as Path
+from pathlib import PurePosixPath
+from uuid import uuid4
 
 from django.core.files.base import ContentFile
+from django.utils.text import slugify
 from PIL import Image, ImageOps
 
 # Lado mayor. El lugar más grande del sitio es la portada del artículo, que se
@@ -115,6 +117,29 @@ def optimizar_bytes(datos, max_side=MAX_SIDE):
     return nuevo, destino
 
 
+def _nombre_optimizado(nombre_actual, destino):
+    """Nombre del archivo optimizado, a partir del que traía.
+
+    Tres cosas que parecen de más y no lo son:
+
+    1. **Solo el nombre, sin la carpeta.** `FieldFile.save()` vuelve a aplicar
+       el `upload_to` del campo, así que pasarle la ruta completa de un archivo
+       ya guardado daría 'articles/articles/foto.webp'.
+    2. **La extensión sigue al formato real.** Un archivo con bytes WebP y
+       nombre .jpg se serviría con el Content-Type equivocado.
+    3. **El nombre se slugifica y tiene respaldo.** Éste es el que duele: el
+       nombre viene del cliente y puede ser cualquier cosa. Django le saca todo
+       lo que no sea ASCII al guardar, así que una foto llamada "☆.jpeg"
+       terminaba en disco como ".webp" — sin nombre, y chocando con cualquier
+       otra igual de anónima. Slugificar acá se adelanta a ese recorte, y el
+       uuid cubre el caso en que no quede ni una letra.
+    """
+    tallo = slugify(PurePosixPath(nombre_actual).name.rsplit('.', 1)[0])
+    if not tallo:
+        tallo = uuid4().hex[:12]
+    return f'{tallo}{EXTENSIONES[destino]}'
+
+
 def optimizar_imagen(field_file, max_side=MAX_SIDE):
     """Versión para un `ImageField` ya asignado. Reemplaza el contenido del
     campo sin persistir el modelo — de eso se encarga el `save()` que llama."""
@@ -133,12 +158,5 @@ def optimizar_imagen(field_file, max_side=MAX_SIDE):
         return False
 
     datos, destino = resultado
-    # Solo el nombre, sin la carpeta: `FieldFile.save()` vuelve a aplicar el
-    # `upload_to` del campo, así que pasarle la ruta completa que ya tiene un
-    # archivo guardado daría 'articles/articles/foto.webp'.
-    #
-    # La extensión sigue al formato real: un archivo con bytes WebP y nombre
-    # .jpg se serviría con el Content-Type equivocado.
-    nombre = Path(field_file.name).with_suffix(EXTENSIONES[destino]).name
-    field_file.save(nombre, ContentFile(datos), save=False)
+    field_file.save(_nombre_optimizado(field_file.name, destino), ContentFile(datos), save=False)
     return True

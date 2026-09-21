@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag, Volume
+from .models import Article, Author, Category, Event, LibraryPiece, NewsletterSubscriber, Region, Tag, Volume
 
 
 def _absolute_file_url(field_file, context):
@@ -265,3 +265,63 @@ class EventAdminSerializer(EventSerializer):
 
     class Meta(EventSerializer.Meta):
         fields = EventSerializer.Meta.fields + ['status', 'coverImage']
+
+
+class LibrarySerializer(serializers.ModelSerializer):
+    """Forma 1:1 con la interfaz LibraryPiece de lib/types.ts en el frontend."""
+
+    id = serializers.CharField(source='pk', read_only=True)
+    author = AuthorSerializer(read_only=True)
+    narrator = AuthorSerializer(read_only=True)
+    coverImageUrl = serializers.SerializerMethodField()
+    audioUrl = serializers.SerializerMethodField()
+    sourceNote = serializers.CharField(source='source_note', read_only=True)
+    publishedAt = serializers.DateTimeField(source='published_at', read_only=True)
+
+    class Meta:
+        model = LibraryPiece
+        fields = [
+            'id', 'slug', 'title', 'genre', 'body',
+            'author', 'narrator', 'coverImageUrl', 'audioUrl', 'sourceNote', 'publishedAt',
+        ]
+
+    def get_coverImageUrl(self, obj):
+        return _absolute_file_url(obj.cover_image, self.context)
+
+    def get_audioUrl(self, obj):
+        return _absolute_file_url(obj.audio, self.context)
+
+
+class LibraryAdminSerializer(LibrarySerializer):
+    """Misma forma de lectura que el público, pero escribible y con `status`.
+
+    author/narrator entran como id plano y salen anidados (igual que
+    ArticleAdminSerializer); coverImage y audio son write-only y llegan como
+    multipart/form-data, mientras la lectura sigue siendo la URL absoluta.
+    """
+
+    author = serializers.PrimaryKeyRelatedField(queryset=Author.objects.all())
+    narrator = serializers.PrimaryKeyRelatedField(
+        queryset=Author.objects.all(), required=False, allow_null=True
+    )
+    coverImage = serializers.ImageField(source='cover_image', write_only=True, required=False, allow_null=True)
+    audio = serializers.FileField(write_only=True, required=False, allow_null=True)
+    sourceNote = serializers.CharField(source='source_note', required=False, allow_blank=True)
+    slug = serializers.SlugField(read_only=True)
+
+    class Meta(LibrarySerializer.Meta):
+        # `coverImage` y `audio` son los campos de escritura; `coverImageUrl` y
+        # `audioUrl` (heredados) los de lectura. Los cuatro tienen que figurar:
+        # un campo declarado arriba pero ausente de esta lista lo ignora DRF en
+        # silencio, y la subida del audio no llegaría nunca al modelo.
+        fields = LibrarySerializer.Meta.fields + ['status', 'coverImage', 'audio']
+
+    def to_representation(self, instance):
+        # PrimaryKeyRelatedField devolvería el id pelado; el panel necesita el
+        # nombre para llenar la tabla sin un segundo pedido por fila.
+        data = super().to_representation(instance)
+        data['author'] = AuthorSerializer(instance.author, context=self.context).data
+        data['narrator'] = (
+            AuthorSerializer(instance.narrator, context=self.context).data if instance.narrator else None
+        )
+        return data

@@ -17,5 +17,7 @@ urlpatterns = [
     path('categories/', views.CategoryListView.as_view(), name='category-list'),
     path('categories/<slug:slug>/', views.CategoryDetailView.as_view(), name='category-detail'),
     path('events/', views.EventListView.as_view(), name='event-list'),
+    path('library/', views.LibraryListView.as_view(), name='library-list'),
+    path('library/<slug:slug>/', views.LibraryDetailView.as_view(), name='library-detail'),
     path('newsletter/', views.NewsletterSubscribeView.as_view(), name='newsletter-subscribe'),
 ]

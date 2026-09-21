@@ -1,4 +1,5 @@
 from django.db import models
+from django.utils import timezone
 from django.utils.text import slugify
 from PIL import Image, ImageOps
 
@@ -303,3 +304,68 @@ class Article(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class LibraryPiece(models.Model):
+    """Obra literaria ajena — un cuento, un poema o una crónica de otro autor,
+    con su narración en audio.
+
+    Deliberadamente NO es una categoría más de Article. Un artículo es la
+    crítica que la revista escribe *sobre* la literatura; esto es la literatura
+    misma. Si compartieran modelo, un poema de Vallejo saldría en el carrusel
+    del inicio y en el RSS como si fuera una nota firmada por El Hacedor.
+
+    `narrator` apunta a Author y no a una tabla aparte: Author ya tiene nombre,
+    bio, foto y región, que es justo lo que necesita la ficha de un lector, y
+    así la misma persona es una sola fila esté narrando o escribiendo.
+    """
+
+    GENRE_CHOICES = [
+        ('cuento', 'Cuento'),
+        ('poema', 'Poema'),
+        ('cronica', 'Crónica'),
+    ]
+    STATUS_CHOICES = [
+        ('published', 'Publicado'),
+        ('draft', 'Borrador'),
+        ('trashed', 'Eliminado'),
+    ]
+
+    slug = models.SlugField(unique=True, blank=True)
+    title = models.CharField(max_length=255)
+    author = models.ForeignKey(Author, on_delete=models.PROTECT, related_name='library_pieces')
+    # SET_NULL y no PROTECT: borrar a un narrador no tiene por qué bloquearse
+    # por las piezas que leyó — la obra sigue existiendo, se queda sin crédito
+    # de voz. Con el autor es al revés, y por eso va PROTECT: una obra sin autor
+    # no es nada.
+    narrator = models.ForeignKey(
+        Author, on_delete=models.SET_NULL, null=True, blank=True, related_name='narrated_pieces'
+    )
+    genre = models.CharField(max_length=20, choices=GENRE_CHOICES, default='poema')
+    body = models.TextField(blank=True)
+    cover_image = models.ImageField(upload_to='library/', blank=True, null=True)
+    audio = models.FileField(upload_to='library-audio/', blank=True, null=True)
+    source_note = models.CharField(
+        max_length=255, blank=True, help_text='De dónde sale la pieza. Ej. "de Trilce, 1922".'
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    published_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        # Alfabético y no cronológico: el índice público es A-Z. Ponerlo en el
+        # Meta evita tener que acordarse de ordenar en cada consulta.
+        ordering = ['title']
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = _unique_slug(type(self), self.title, self.pk)
+        # La fecha se sella sola la primera vez que se publica: es dato de
+        # archivo, no algo que el editor tenga que cargar a mano.
+        if self.status == 'published' and self.published_at is None:
+            self.published_at = timezone.now()
+        if self.cover_image:
+            optimizar_imagen(self.cover_image)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.title} — {self.author.name}'

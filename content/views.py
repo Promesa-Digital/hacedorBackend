@@ -6,13 +6,14 @@ from rest_framework.views import APIView
 from rest_framework.throttling import ScopedRateThrottle
 from django.utils import timezone
 
-from .models import Article, Author, Category, Event, NewsletterSubscriber, Region, Tag, Volume
+from .models import Article, Author, Category, Event, LibraryPiece, NewsletterSubscriber, Region, Tag, Volume
 from .serializers import (
     ArticleDetailSerializer,
     ArticleListSerializer,
     AuthorSerializer,
     CategorySerializer,
     EventSerializer,
+    LibrarySerializer,
     NewsletterSubscriberSerializer,
     RegionSerializer,
     TagSerializer,
@@ -226,3 +227,30 @@ class EventListView(generics.ListAPIView):
     serializer_class = EventSerializer
     queryset = Event.objects.filter(status='published')
     pagination_class = None
+
+
+class LibraryListView(generics.ListAPIView):
+    """GET /api/library/?genre= — el índice de la Biblioteca.
+
+    Sin paginar y devolviendo todo: el índice alfabético del frontend agrupa
+    por la primera letra del título, y resolverlo en el cliente con una sola
+    respuesta es más barato que 27 pedidos, uno por letra.
+    """
+
+    serializer_class = LibrarySerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        queryset = LibraryPiece.objects.filter(status='published').select_related('author', 'narrator')
+        genre = self.request.query_params.get('genre')
+        # Un género inventado devuelve vacío y no un 400: el filtro llega de un
+        # parámetro de URL que cualquiera puede escribir a mano.
+        return queryset.filter(genre=genre) if genre else queryset
+
+
+class LibraryDetailView(generics.RetrieveAPIView):
+    """GET /api/library/<slug>/ — una pieza."""
+
+    serializer_class = LibrarySerializer
+    lookup_field = 'slug'
+    queryset = LibraryPiece.objects.filter(status='published').select_related('author', 'narrator')
