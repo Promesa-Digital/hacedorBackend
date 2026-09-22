@@ -1053,3 +1053,45 @@ class NombreDeArchivoOptimizadoTests(AdminAPITestCase):
 
     def test_dos_archivos_anonimos_no_se_pisan(self):
         self.assertNotEqual(self._subir('☆.jpeg'), self._subir('★.jpeg'))
+
+
+class PortadaPanoramicaTests(AdminAPITestCase):
+    """Las portadas de las entrevistas son banners de 2400x630 con el nombre
+    escrito grande. Tratadas como una foto apaisada cualquiera, la caja 3:2 de
+    la tarjeta les cortaba el 61% del ancho y el nombre quedaba ilegible."""
+
+    def _con_portada(self, w, h):
+        art = Article.objects.create(
+            title=f'Portada {w}x{h}', body='x', category=self.category, author=self.author,
+            published_at=timezone.now(),
+            cover_image=SimpleUploadedFile(f'{w}x{h}.jpg', _imagen_bytes(w, h), content_type='image/jpeg'),
+        )
+        art.refresh_from_db()
+        return art
+
+    def test_un_banner_se_marca_como_panoramico(self):
+        self.assertEqual(self._con_portada(2400, 630).cover_image_orientation, 'panoramic')
+
+    def test_una_foto_apaisada_normal_sigue_siendo_horizontal(self):
+        # 3:2 y 16:9 son fotos, no banners: toleran el recorte.
+        self.assertEqual(self._con_portada(1800, 1200).cover_image_orientation, 'landscape')
+        self.assertEqual(self._con_portada(1920, 1080).cover_image_orientation, 'landscape')
+
+    def test_el_limite_esta_en_2_2(self):
+        self.assertEqual(self._con_portada(2100, 1000).cover_image_orientation, 'landscape')   # 2.10
+        self.assertEqual(self._con_portada(2300, 1000).cover_image_orientation, 'panoramic')   # 2.30
+
+    def test_guarda_las_medidas_reales(self):
+        # Se guardan DESPUÉS de optimizar, así que son las del archivo que se
+        # sirve, no las del original: el frontend arma la caja con estas.
+        art = self._con_portada(2400, 630)
+        self.assertEqual((art.cover_image_width, art.cover_image_height), (2400, 630))
+
+    def test_las_medidas_son_las_del_archivo_ya_achicado(self):
+        art = self._con_portada(4000, 1000)
+        self.assertEqual(art.cover_image_width, 2400)
+        with Image.open(art.cover_image) as img:
+            self.assertEqual(img.size, (art.cover_image_width, art.cover_image_height))
+
+    def test_una_vertical_no_se_confunde(self):
+        self.assertEqual(self._con_portada(1000, 2400).cover_image_orientation, 'portrait')

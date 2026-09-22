@@ -143,6 +143,10 @@ class ArticleListSerializer(serializers.ModelSerializer):
     readingTimeMinutes = serializers.IntegerField(source='reading_time_minutes', read_only=True)
     coverImageUrl = serializers.SerializerMethodField()
     coverImageOrientation = serializers.CharField(source='cover_image_orientation', read_only=True)
+    # Las medidas van al frontend para poder armar una caja con la proporción
+    # exacta de un banner y no recortarle el nombre del entrevistado.
+    coverImageWidth = serializers.IntegerField(source='cover_image_width', read_only=True)
+    coverImageHeight = serializers.IntegerField(source='cover_image_height', read_only=True)
     hasNarration = serializers.BooleanField(source='has_narration', read_only=True)
     narrationAudioUrl = serializers.SerializerMethodField()
     youtubeEmbedUrl = serializers.CharField(source='youtube_embed_url', read_only=True)
@@ -154,6 +158,7 @@ class ArticleListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'slug', 'title', 'excerpt', 'category', 'tags', 'author',
             'publishedAt', 'readingTimeMinutes', 'coverImageUrl', 'coverImageOrientation',
+            'coverImageWidth', 'coverImageHeight',
             'hasNarration', 'narrationAudioUrl', 'youtubeEmbedUrl', 'spotifyEmbedUrl',
             'region', 'status', 'scheduledFor',
         ]

@@ -227,7 +227,16 @@ class Article(models.Model):
         ('landscape', 'Horizontal'),
         ('portrait', 'Vertical'),
         ('square', 'Cuadrada'),
+        ('panoramic', 'Banner'),
     ]
+
+    # A partir de acá una imagen deja de ser una foto apaisada y pasa a ser un
+    # banner. Las portadas de las entrevistas son 2400x630 (3.8:1): metidas en
+    # la caja 3:2 de una tarjeta se les recortaba el 61% del ancho y el nombre
+    # del entrevistado quedaba ilegible ("ERESA RUI" en vez de "TERESA RUIZ").
+    # 2.2 deja del lado de "foto" a las panorámicas normales, que sí toleran el
+    # recorte porque no tienen texto en los bordes.
+    PANORAMIC_RATIO = 2.2
 
     slug = models.SlugField(unique=True, blank=True)
     title = models.CharField(max_length=255)
@@ -245,6 +254,10 @@ class Article(models.Model):
 
     cover_image = models.ImageField(upload_to='articles/', blank=True, null=True)
     cover_image_orientation = models.CharField(max_length=10, choices=ORIENTATION_CHOICES, default='landscape')
+    # Las medidas reales, para que el frontend pueda armar una caja con la
+    # proporción exacta de un banner y no recortarle nada.
+    cover_image_width = models.PositiveIntegerField(null=True, blank=True)
+    cover_image_height = models.PositiveIntegerField(null=True, blank=True)
 
     has_narration = models.BooleanField(default=False)
     narration_audio = models.FileField(upload_to='narration/', blank=True, null=True)
@@ -291,7 +304,11 @@ class Article(models.Model):
                     # que sin esto un retrato se medía como apaisado y
                     # terminaba recortado a 21:9.
                     width, height = ImageOps.exif_transpose(img).size
-                if width > height:
+                self.cover_image_width = width
+                self.cover_image_height = height
+                if width / height >= self.PANORAMIC_RATIO:
+                    self.cover_image_orientation = 'panoramic'
+                elif width > height:
                     self.cover_image_orientation = 'landscape'
                 elif height > width:
                     self.cover_image_orientation = 'portrait'
