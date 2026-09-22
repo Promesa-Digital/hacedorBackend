@@ -1095,3 +1095,57 @@ class PortadaPanoramicaTests(AdminAPITestCase):
 
     def test_una_vertical_no_se_confunde(self):
         self.assertEqual(self._con_portada(1000, 2400).cover_image_orientation, 'portrait')
+
+
+class RecalculoDePortadasTests(AdminAPITestCase):
+    """La migración 0009 arregla las portadas que ya estaban cargadas.
+
+    Sin ella, desplegar la detección de banners no cambia nada: la orientación
+    se calcula en `save()`, así que los artículos viejos se quedan como están y
+    las entrevistas se siguen viendo recortadas. Pasó de verdad en producción.
+    """
+
+    def _pre_migracion(self, ancho, alto):
+        """Un artículo como quedaban antes: con portada, pero con la
+        orientación vieja y sin medidas."""
+        art = Article.objects.create(
+            title=f'Vieja {ancho}x{alto}', body='x', category=self.category, author=self.author,
+            published_at=timezone.now(),
+            cover_image=SimpleUploadedFile(f'v{ancho}.jpg', _imagen_bytes(ancho, alto), content_type='image/jpeg'),
+        )
+        Article.objects.filter(pk=art.pk).update(
+            cover_image_orientation='landscape', cover_image_width=None, cover_image_height=None
+        )
+        return art.pk
+
+    def _correr_migracion(self):
+        import importlib
+
+        from django.apps import apps
+
+        modulo = importlib.import_module('content.migrations.0009_recalcular_portadas')
+        modulo.recalcular(apps, None)
+
+    def test_un_banner_viejo_pasa_a_panoramico(self):
+        pk = self._pre_migracion(2400, 630)
+        self._correr_migracion()
+        art = Article.objects.get(pk=pk)
+        self.assertEqual(art.cover_image_orientation, 'panoramic')
+        self.assertEqual((art.cover_image_width, art.cover_image_height), (2400, 630))
+
+    def test_una_foto_vieja_queda_horizontal(self):
+        pk = self._pre_migracion(1800, 1200)
+        self._correr_migracion()
+        self.assertEqual(Article.objects.get(pk=pk).cover_image_orientation, 'landscape')
+
+    def test_una_vertical_mal_clasificada_se_corrige(self):
+        pk = self._pre_migracion(1000, 1500)
+        self._correr_migracion()
+        self.assertEqual(Article.objects.get(pk=pk).cover_image_orientation, 'portrait')
+
+    def test_una_portada_que_falta_en_disco_no_voltea_la_migracion(self):
+        pk = self._pre_migracion(1800, 1200)
+        art = Article.objects.get(pk=pk)
+        art.cover_image.storage.delete(art.cover_image.name)
+        self._correr_migracion()  # no debe levantar
+        self.assertEqual(Article.objects.get(pk=pk).cover_image_orientation, 'landscape')
