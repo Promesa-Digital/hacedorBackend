@@ -27,11 +27,29 @@ class Region(models.Model):
     tres cifras (ej. "040" para Arequipa) usado en las rutas públicas
     (/mapa-regional/<code>) y como filtro de Article/Author."""
 
+    # Lado mayor de la miniatura de región. Muy por debajo de MAX_SIDE a
+    # propósito: esta imagen solo se ve como banda superior de una tarjeta del
+    # Mapa Regional. Medido en el navegador, esa tarjeta mide 349 px en la
+    # grilla más ancha, así que en una pantalla Retina necesita 698 px reales;
+    # 640 se quedaba corto y la foto salía apenas borrosa. 960 cubre ese doble
+    # con margen para grillas más anchas, y nada más: guardarlas a 2400 como
+    # las portadas sería mandar 25 fotos de varios cientos de kB cada una para
+    # mostrarlas del tamaño de un sello.
+    MAX_SIDE_MINIATURA = 960
+
     name = models.CharField(max_length=100, unique=True)
     code = models.CharField(max_length=10, unique=True)  # ej. "040"
+    # Imagen referente de la ciudad/región, opcional: el cliente va a cargar
+    # las 25 de a poco, así que la tarjeta tiene que saber dibujarse sin ella.
+    image = models.ImageField(upload_to='regions/', blank=True, null=True)
 
     class Meta:
         ordering = ['name']
+
+    def save(self, *args, **kwargs):
+        if self.image:
+            optimizar_imagen(self.image, max_side=self.MAX_SIDE_MINIATURA)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -259,6 +277,12 @@ class Article(models.Model):
     cover_image_width = models.PositiveIntegerField(null=True, blank=True)
     cover_image_height = models.PositiveIntegerField(null=True, blank=True)
 
+    # Interruptor por pieza, no formato por párrafo: la capital es una decisión
+    # editorial sobre la nota entera (se usa o no se usa), y solo puede haber
+    # una. Si fuera un botón de la barra de formato, un editor podría dejar tres
+    # capitales en la misma nota sin darse cuenta.
+    drop_cap = models.BooleanField(default=False, help_text='Letra capital en la primera letra del primer párrafo del cuerpo.')
+
     has_narration = models.BooleanField(default=False)
     narration_audio = models.FileField(upload_to='narration/', blank=True, null=True)
     youtube_embed_url = models.URLField(blank=True)
@@ -324,8 +348,8 @@ class Article(models.Model):
 
 
 class LibraryPiece(models.Model):
-    """Obra literaria ajena — un cuento, un poema o una crónica de otro autor,
-    con su narración en audio.
+    """Obra literaria ajena — un cuento, una novela, un poema, un discurso… de
+    otro autor, con su narración en audio.
 
     Deliberadamente NO es una categoría más de Article. Un artículo es la
     crítica que la revista escribe *sobre* la literatura; esto es la literatura
@@ -337,10 +361,18 @@ class LibraryPiece(models.Model):
     así la misma persona es una sola fila esté narrando o escribiendo.
     """
 
+    # Tiene que coincidir con LIBRARY_GENRES de
+    # frontend/src/lib/library-genres.ts, que es de donde salen el desplegable
+    # del panel y el filtro público. Si se agrega uno acá, va también allá.
     GENRE_CHOICES = [
         ('cuento', 'Cuento'),
+        ('microcuento', 'Microcuento'),
+        ('novela', 'Novela'),
         ('poema', 'Poema'),
         ('cronica', 'Crónica'),
+        ('ensayo', 'Ensayo'),
+        ('discurso', 'Discurso'),
+        ('otros', 'Otros textos'),
     ]
     STATUS_CHOICES = [
         ('published', 'Publicado'),
@@ -360,6 +392,10 @@ class LibraryPiece(models.Model):
     )
     genre = models.CharField(max_length=20, choices=GENRE_CHOICES, default='poema')
     body = models.TextField(blank=True)
+    # Misma decisión que en Article: una sola capital por pieza, encendida o
+    # apagada desde el panel. Apagada por defecto porque en poesía (el grueso de
+    # la Biblioteca) una capital de cuatro líneas se come el primer verso.
+    drop_cap = models.BooleanField(default=False, help_text='Letra capital en la primera letra del primer párrafo del cuerpo.')
     cover_image = models.ImageField(upload_to='library/', blank=True, null=True)
     audio = models.FileField(upload_to='library-audio/', blank=True, null=True)
     source_note = models.CharField(

@@ -19,5 +19,6 @@ urlpatterns = [
     path('events/', views.EventListView.as_view(), name='event-list'),
     path('library/', views.LibraryListView.as_view(), name='library-list'),
     path('library/<slug:slug>/', views.LibraryDetailView.as_view(), name='library-detail'),
+    path('narrated/', views.NarratedListView.as_view(), name='narrated-list'),
     path('newsletter/', views.NewsletterSubscribeView.as_view(), name='newsletter-subscribe'),
 ]

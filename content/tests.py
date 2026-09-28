@@ -1,10 +1,12 @@
 import io
+import tempfile
+from pathlib import Path as PathLib
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from PIL import Image
 from rest_framework import status
@@ -58,8 +60,22 @@ def make_image_file(width, height, name='cover.jpg'):
     return SimpleUploadedFile(name, buffer.read(), content_type='image/jpeg')
 
 
+# Las pruebas suben imágenes de verdad, y sin esto quedaban guardadas en el
+# media/ del proyecto: 307 archivos en disco contra 11 referenciados por la base.
+# Cada corrida dejaba decenas de huérfanos que nadie iba a borrar nunca.
+# Con un directorio temporal, el sistema operativo se encarga.
+# Path y no el texto que devuelve mkdtemp: el MEDIA_ROOT real es un Path y hay
+# pruebas que hacen `settings.MEDIA_ROOT / 'inline'`. Con un str eso revienta.
+MEDIA_DE_PRUEBA = PathLib(tempfile.mkdtemp(prefix='elhacedor-tests-'))
+
+
+@override_settings(MEDIA_ROOT=MEDIA_DE_PRUEBA)
 class AdminAPITestCase(APITestCase):
-    """Base con un usuario admin autenticado vía Bearer y taxonomía mínima."""
+    """Base con un usuario admin autenticado vía Bearer y taxonomía mínima.
+
+    El MEDIA_ROOT temporal se hereda en las subclases: Django aplica el
+    `override_settings` del padre a todo lo que cuelgue de él.
+    """
 
     def setUp(self):
         # El limitador de tasa del login (60/minuto) cuenta en la caché, que en
@@ -620,6 +636,7 @@ class InlineImageUploadTests(AdminAPITestCase):
         self.assertNotIn('passwd', res.data['url'])
 
 
+@override_settings(MEDIA_ROOT=MEDIA_DE_PRUEBA)
 class MediaRangeRequestTests(APITestCase):
     """Entrega de archivos subidos por tramos (HTTP Range).
 
@@ -911,6 +928,7 @@ class LibraryPieceModelTests(AdminAPITestCase):
         self.assertIsNone(self._pieza().published_at)
 
 
+@override_settings(MEDIA_ROOT=MEDIA_DE_PRUEBA)
 class LibraryPublicAPITests(APITestCase):
     def setUp(self):
         self.region = Region.objects.create(name='Arequipa', code='040')
@@ -1149,3 +1167,340 @@ class RecalculoDePortadasTests(AdminAPITestCase):
         art.cover_image.storage.delete(art.cover_image.name)
         self._correr_migracion()  # no debe levantar
         self.assertEqual(Article.objects.get(pk=pk).cover_image_orientation, 'landscape')
+
+
+class GenerosDeBibliotecaTests(AdminAPITestCase):
+    def test_se_pueden_guardar_los_ocho_generos(self):
+        esperados = ['cuento', 'microcuento', 'novela', 'poema', 'cronica', 'ensayo', 'discurso', 'otros']
+        self.assertEqual([v for v, _ in LibraryPiece.GENRE_CHOICES], esperados)
+        for genero in esperados:
+            pieza = LibraryPiece.objects.create(title=f'Pieza {genero}', author=self.author, genre=genero)
+            pieza.refresh_from_db()
+            self.assertEqual(pieza.genre, genero)
+
+    def test_todos_entran_en_el_campo(self):
+        largo = LibraryPiece._meta.get_field('genre').max_length
+        for valor, _ in LibraryPiece.GENRE_CHOICES:
+            self.assertLessEqual(len(valor), largo, valor)
+
+    def test_el_filtro_publico_anda_con_los_nuevos(self):
+        LibraryPiece.objects.create(title='Una novela', author=self.author, genre='novela', status='published')
+        LibraryPiece.objects.create(title='Un discurso', author=self.author, genre='discurso', status='published')
+        self.assertEqual([p['title'] for p in self.client.get('/api/library/?genre=novela').data], ['Una novela'])
+        self.assertEqual([p['title'] for p in self.client.get('/api/library/?genre=discurso').data], ['Un discurso'])
+
+
+class NarradosPublicAPITests(APITestCase):
+    """`/api/narrated/` — la lista única de todo lo que tiene voz."""
+
+    def setUp(self):
+        # Igual que en las demás: la caché del limitador de tasa es de proceso y
+        # sobrevive de un test al siguiente, así que sin esto la suite falla
+        # según el orden y la cantidad de pruebas.
+        cache.clear()
+        self.categoria = Category.objects.create(slug='critica-literaria', label='Crítica Literaria')
+        self.autor = Author.objects.create(name='César Vallejo')
+        self.narradora = Author.objects.create(name='Delfina Paredes')
+        ahora = timezone.now()
+
+        def crear_articulo(titulo, dias, **extra):
+            datos = {
+                'title': titulo,
+                'excerpt': 'resumen',
+                'category': self.categoria,
+                'author': self.autor,
+                'published_at': ahora - timezone.timedelta(days=dias),
+                'status': 'published',
+                'narration_audio': 'narration/lectura.mp3',
+            }
+            datos.update(extra)
+            return Article.objects.create(**datos)
+
+        def crear_pieza(titulo, dias, **extra):
+            datos = {
+                'title': titulo,
+                'author': self.autor,
+                'narrator': self.narradora,
+                'genre': 'poema',
+                'body': 'verso',
+                'status': 'published',
+                'published_at': ahora - timezone.timedelta(days=dias),
+                'audio': 'library-audio/lectura.mp3',
+            }
+            datos.update(extra)
+            return LibraryPiece.objects.create(**datos)
+
+        # Intercalados a propósito, para que un orden correcto solo pueda salir
+        # de mezclar los dos modelos y no de concatenarlos.
+        crear_articulo('Artículo reciente', 1)
+        crear_pieza('Pieza del medio', 2)
+        crear_articulo('Artículo viejo', 3)
+        crear_pieza('Pieza vieja', 4)
+        # Los que NO tienen que salir.
+        crear_articulo('Artículo borrador', 1, status='draft')
+        crear_articulo('Artículo sin audio', 1, narration_audio='')
+        crear_pieza('Pieza borrador', 1, status='draft')
+        crear_pieza('Pieza sin audio', 1, audio='')
+
+    def test_mezcla_los_dos_tipos_ordenados_por_fecha(self):
+        response = self.client.get('/api/narrated/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item['title'] for item in response.data['items']],
+            ['Artículo reciente', 'Pieza del medio', 'Artículo viejo', 'Pieza vieja'],
+        )
+        self.assertEqual(response.data['total'], 4)
+
+    def test_devuelve_la_forma_comun_de_un_articulo(self):
+        item = self.client.get('/api/narrated/').data['items'][0]
+        self.assertEqual(item['kind'], 'article')
+        self.assertEqual(item['url'], '/articulo/articulo-reciente/')
+        self.assertEqual(item['label'], 'Crítica Literaria')
+        self.assertEqual(item['author']['name'], 'César Vallejo')
+        self.assertIsNone(item['narrator'])
+        self.assertIn('lectura.mp3', item['audioUrl'])
+        self.assertIsNone(item['coverImageUrl'])
+
+    def test_devuelve_la_forma_comun_de_una_pieza(self):
+        item = self.client.get('/api/narrated/').data['items'][1]
+        self.assertEqual(item['kind'], 'library')
+        self.assertEqual(item['url'], '/biblioteca/pieza-del-medio/')
+        self.assertEqual(item['label'], 'Poema')
+        self.assertEqual(item['narrator']['name'], 'Delfina Paredes')
+        self.assertEqual(item['excerpt'], 'verso')
+
+    def test_la_url_siempre_termina_en_barra(self):
+        # trailingSlash: 'always' en el frontend: sin la barra final el enlace da
+        # 404 en vez de redirigir.
+        for item in self.client.get('/api/narrated/').data['items']:
+            self.assertTrue(item['url'].endswith('/'), item['url'])
+
+    def test_filtra_por_tipo_articulo(self):
+        response = self.client.get('/api/narrated/?type=article')
+        self.assertEqual([i['title'] for i in response.data['items']], ['Artículo reciente', 'Artículo viejo'])
+        self.assertEqual(response.data['total'], 2)
+
+    def test_filtra_por_tipo_biblioteca(self):
+        response = self.client.get('/api/narrated/?type=library')
+        self.assertEqual([i['title'] for i in response.data['items']], ['Pieza del medio', 'Pieza vieja'])
+        self.assertEqual(response.data['total'], 2)
+
+    def test_un_tipo_invalido_da_400(self):
+        response = self.client.get('/api/narrated/?type=podcast')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('type', response.data)
+
+    def test_no_aparecen_borradores_ni_contenido_sin_audio(self):
+        titulos = {i['title'] for i in self.client.get('/api/narrated/').data['items']}
+        self.assertEqual(
+            titulos & {'Artículo borrador', 'Artículo sin audio', 'Pieza borrador', 'Pieza sin audio'},
+            set(),
+        )
+
+    def test_pagina_sin_repetir_ni_perder_filas(self):
+        primera = self.client.get('/api/narrated/?pageSize=2&page=1').data
+        segunda = self.client.get('/api/narrated/?pageSize=2&page=2').data
+        self.assertEqual([i['title'] for i in primera['items']], ['Artículo reciente', 'Pieza del medio'])
+        self.assertEqual([i['title'] for i in segunda['items']], ['Artículo viejo', 'Pieza vieja'])
+        # El total es el de la colección completa, no el de la página.
+        self.assertEqual(primera['total'], 4)
+        self.assertEqual(segunda['total'], 4)
+
+    def test_una_pagina_que_no_existe_da_404(self):
+        self.assertEqual(
+            self.client.get('/api/narrated/?pageSize=2&page=9').status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_la_paginacion_respeta_el_filtro_por_tipo(self):
+        response = self.client.get('/api/narrated/?type=library&pageSize=1&page=2').data
+        self.assertEqual([i['title'] for i in response['items']], ['Pieza vieja'])
+        self.assertEqual(response['total'], 2)
+
+
+class RegionImagenTests(AdminAPITestCase):
+    """La imagen referente de cada región del Mapa Regional.
+
+    Hereda de AdminAPITestCase por el MEDIA_ROOT temporal y el cache.clear()
+    del limitador de tasa: estas pruebas suben archivos de verdad y sin eso
+    ensuciarían el media/ del proyecto.
+    """
+
+    def _subir(self, region=None, nombre='plaza.jpg', ancho=1600, alto=1200):
+        destino = region or self.region
+        return self.client.patch(
+            f'/api/admin/regions/{destino.id}/',
+            {'image': SimpleUploadedFile(nombre, _imagen_bytes(ancho, alto), content_type='image/jpeg')},
+            format='multipart',
+        )
+
+    def test_la_imagen_se_optimiza_a_webp_y_se_achica(self):
+        respuesta = self._subir()
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+
+        self.region.refresh_from_db()
+        self.assertTrue(self.region.image.name.endswith('.webp'), self.region.image.name)
+        with Image.open(self.region.image) as img:
+            self.assertEqual(max(img.size), Region.MAX_SIDE_MINIATURA)
+
+    def test_el_nombre_no_anida_la_carpeta(self):
+        # El bug conocido: `FieldFile.save()` vuelve a aplicar `upload_to`, así
+        # que pasarle la ruta completa daba 'regions/regions/plaza.webp'.
+        self._subir()
+        self.region.refresh_from_db()
+        self.assertTrue(self.region.image.name.startswith('regions/'), self.region.image.name)
+        self.assertNotIn('regions/regions/', self.region.image.name)
+
+    def test_reguardar_no_vuelve_a_reencodar(self):
+        self._subir()
+        self.region.refresh_from_db()
+        nombre, peso = self.region.image.name, self.region.image.size
+
+        self.region.save()
+
+        self.region.refresh_from_db()
+        self.assertEqual(self.region.image.name, nombre)
+        self.assertEqual(self.region.image.size, peso)
+
+    def test_se_puede_quitar_la_imagen(self):
+        self._subir()
+        self.region.refresh_from_db()
+        ruta_anterior = self.region.image.name
+
+        respuesta = self.client.patch(f'/api/admin/regions/{self.region.id}/', {'image': None}, format='json')
+
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIsNone(respuesta.data['imageUrl'])
+        self.region.refresh_from_db()
+        self.assertFalse(self.region.image)
+        # El archivo no queda huérfano en disco.
+        self.assertFalse(default_storage.exists(ruta_anterior))
+
+    def test_sin_autenticacion_no_se_puede_modificar(self):
+        self.client.credentials()
+        respuesta = self._subir()
+        self.assertEqual(respuesta.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.region.refresh_from_db()
+        self.assertFalse(self.region.image)
+
+    def test_image_url_es_null_sin_imagen(self):
+        respuesta = self.client.get('/api/regions/')
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        propia = next(r for r in respuesta.data if r['code'] == self.region.code)
+        self.assertIsNone(propia['imageUrl'])
+
+    def test_image_url_es_absoluta_cuando_hay_imagen(self):
+        self._subir()
+        respuesta = self.client.get('/api/regions/')
+        propia = next(r for r in respuesta.data if r['code'] == self.region.code)
+        self.assertTrue(propia['imageUrl'].startswith('http://'), propia['imageUrl'])
+        self.assertIn('/media/regions/', propia['imageUrl'])
+
+
+class LetraCapitalTests(AdminAPITestCase):
+    """El interruptor de letra capital (`drop_cap`) de Article y LibraryPiece.
+
+    Es una propiedad de la pieza, no un formato de párrafo: lo único que hay
+    que garantizar es que nazca apagada y que viaje en las dos direcciones —
+    que el panel la pueda encender y que la lectura pública la devuelva, que es
+    de donde el frontend decide si dibuja la capital.
+    """
+
+    def _crear_articulo(self, **extra):
+        datos = {
+            'title': 'Con capital',
+            'excerpt': 'Resumen',
+            'body': '«Nadie sabía nada.',
+            'category': self.category.slug,
+            'author': self.author.id,
+            'status': 'published',
+        }
+        datos.update(extra)
+        return self.client.post('/api/admin/articles/', datos, format='multipart')
+
+    def _crear_pieza(self, **extra):
+        datos = {'title': 'Masa', 'author': self.author.pk, 'genre': 'poema', 'body': 'verso', 'status': 'published'}
+        datos.update(extra)
+        return self.client.post('/api/admin/library/', datos, format='multipart')
+
+    # ── Por defecto está apagada ──
+
+    def test_un_articulo_nace_sin_capital(self):
+        article = Article.objects.create(
+            title='Sin capital', excerpt='x', body='x',
+            category=self.category, author=self.author, published_at=timezone.now(),
+        )
+        self.assertFalse(article.drop_cap)
+
+    def test_una_pieza_nace_sin_capital(self):
+        self.assertFalse(LibraryPiece.objects.create(title='Masa', author=self.author, genre='poema').drop_cap)
+
+    def test_el_articulo_creado_sin_mandar_el_campo_queda_apagado(self):
+        self.assertIs(self._crear_articulo().data['dropCap'], False)
+
+    def test_la_pieza_creada_sin_mandar_el_campo_queda_apagada(self):
+        self.assertIs(self._crear_pieza().data['dropCap'], False)
+
+    # ── Escritura desde el panel ──
+
+    def test_el_panel_enciende_la_capital_de_un_articulo(self):
+        respuesta = self._crear_articulo(dropCap=True)
+        self.assertEqual(respuesta.status_code, status.HTTP_201_CREATED)
+        self.assertIs(respuesta.data['dropCap'], True)
+        self.assertTrue(Article.objects.get(pk=respuesta.data['id']).drop_cap)
+
+    def test_el_panel_apaga_la_capital_de_un_articulo(self):
+        creado = self._crear_articulo(dropCap=True)
+        respuesta = self.client.patch(
+            f'/api/admin/articles/{creado.data["id"]}/', {'dropCap': False}, format='multipart'
+        )
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIs(respuesta.data['dropCap'], False)
+        self.assertFalse(Article.objects.get(pk=creado.data['id']).drop_cap)
+
+    def test_el_panel_enciende_la_capital_de_una_pieza(self):
+        respuesta = self._crear_pieza(dropCap=True)
+        self.assertEqual(respuesta.status_code, status.HTTP_201_CREATED)
+        self.assertIs(respuesta.data['dropCap'], True)
+        self.assertTrue(LibraryPiece.objects.get(pk=respuesta.data['id']).drop_cap)
+
+    def test_el_panel_apaga_la_capital_de_una_pieza(self):
+        creada = self._crear_pieza(dropCap=True)
+        respuesta = self.client.patch(
+            f'/api/admin/library/{creada.data["id"]}/', {'dropCap': False}, format='multipart'
+        )
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIs(respuesta.data['dropCap'], False)
+        self.assertFalse(LibraryPiece.objects.get(pk=creada.data['id']).drop_cap)
+
+    # ── Lectura pública ──
+
+    def test_el_detalle_publico_del_articulo_trae_la_capital(self):
+        slug = self._crear_articulo(dropCap=True).data['slug']
+        self.client.credentials()
+        respuesta = self.client.get(f'/api/articles/{slug}/')
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIs(respuesta.data['dropCap'], True)
+
+    def test_el_listado_publico_de_articulos_trae_la_capital(self):
+        self._crear_articulo(dropCap=True)
+        self.client.credentials()
+        respuesta = self.client.get('/api/articles/')
+        self.assertIs(respuesta.data['items'][0]['dropCap'], True)
+
+    def test_el_detalle_publico_de_la_pieza_trae_la_capital(self):
+        slug = self._crear_pieza(dropCap=True).data['slug']
+        self.client.credentials()
+        respuesta = self.client.get(f'/api/library/{slug}/')
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIs(respuesta.data['dropCap'], True)
+
+    def test_el_publico_no_puede_escribir_la_capital(self):
+        # El serializer público la declara read_only: un PATCH sin sesión ni
+        # siquiera llega, pero lo que se fija acá es que el campo no sea una
+        # puerta de escritura abierta en el detalle.
+        slug = self._crear_articulo().data['slug']
+        self.client.credentials()
+        respuesta = self.client.patch(f'/api/articles/{slug}/', {'dropCap': True}, format='json')
+        self.assertIn(respuesta.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN, status.HTTP_405_METHOD_NOT_ALLOWED))
+        self.assertFalse(Article.objects.get(slug=slug).drop_cap)

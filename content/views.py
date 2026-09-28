@@ -14,6 +14,8 @@ from .serializers import (
     CategorySerializer,
     EventSerializer,
     LibrarySerializer,
+    NarratedArticleSerializer,
+    NarratedLibrarySerializer,
     NewsletterSubscriberSerializer,
     RegionSerializer,
     TagSerializer,
@@ -254,3 +256,110 @@ class LibraryDetailView(generics.RetrieveAPIView):
     serializer_class = LibrarySerializer
     lookup_field = 'slug'
     queryset = LibraryPiece.objects.filter(status='published').select_related('author', 'narrator')
+
+
+class _SecuenciaNarrada:
+    """Las dos consultas de narrados, vistas como una sola lista ordenada.
+
+    POR QUÉ ESTO Y NO UN QUERYSET: Article y LibraryPiece son tablas distintas
+    con columnas distintas, así que no hay `union()` posible sin recortarlas a
+    un puñado de campos comunes y perder los objetos (y con ellos el serializer,
+    el `select_related` y las URLs absolutas de los archivos). La unión se
+    resuelve en Python.
+
+    POR QUÉ NO TRAER TODO: lo directo sería `list(articulos) + list(piezas)`,
+    ordenar y recortar la página — y eso trae las dos tablas enteras a memoria
+    en cada pedido, incluso para mostrar diez filas.
+
+    El truco es que para armar la página que termina en la fila `fin` alcanza
+    con los primeros `fin` de cada lado: si un elemento no está entre los `fin`
+    más recientes de su propia tabla, tampoco puede estar entre los `fin` más
+    recientes de la mezcla. Así cada consulta lleva su propio LIMIT y el costo
+    de la página N es 2·N·pageSize filas en vez de la base completa.
+
+    El precio de ese camino es real y hay que decirlo: el costo crece con el
+    número de página (la página 10 lee 10 veces más filas que la primera), y el
+    total sale de dos COUNT separados. Con un catálogo de revista —cientos de
+    piezas, no millones— es intercambio conveniente; si algún día esto se va de
+    las manos, lo que corresponde es una tabla/vista materializada de narrados,
+    no seguir inflando esto.
+
+    `count()` y `__getitem__` son lo único que el Paginator de Django le pide a
+    su `object_list`, así que esto entra en ArticlesPagination sin tocarla.
+    """
+
+    def __init__(self, querysets, serializadores):
+        self.querysets = querysets
+        self.serializadores = serializadores
+
+    def count(self):
+        return sum(qs.count() for qs in self.querysets)
+
+    def __len__(self):
+        return self.count()
+
+    def __getitem__(self, corte):
+        fin = corte.stop if isinstance(corte, slice) else None
+        candidatos = []
+        for qs, serializador in zip(self.querysets, self.serializadores):
+            recorte = qs[:fin] if fin is not None else qs
+            candidatos.extend((pieza, serializador) for pieza in recorte)
+        # `-pk` como segundo criterio en las dos consultas y acá: sin un
+        # desempate estable, dos piezas con la misma fecha podían salir en un
+        # orden distinto en cada pedido y una de ellas aparecía dos veces entre
+        # dos páginas mientras la otra no aparecía en ninguna.
+        candidatos.sort(key=lambda par: (par[0].published_at, par[0].pk), reverse=True)
+        return candidatos[corte]
+
+
+class NarratedListView(APIView):
+    """GET /api/narrated/?type=&page=&pageSize= — todo lo narrado en una lista.
+
+    Junta los artículos publicados que tienen narración con las piezas de
+    Biblioteca publicadas que tienen audio, ordenados por fecha de publicación
+    descendente y mezclados entre sí (ver `_SecuenciaNarrada`).
+    """
+
+    def _querysets(self, tipo):
+        articulos = (
+            _article_base_queryset()
+            .filter(status='published', has_narration=True)
+            .exclude(narration_audio='')
+            .exclude(narration_audio__isnull=True)
+            .order_by('-published_at', '-pk')
+        )
+        piezas = (
+            LibraryPiece.objects.filter(status='published')
+            .select_related('author', 'narrator')
+            .exclude(audio='')
+            .exclude(audio__isnull=True)
+            # Sin fecha no hay lugar en un orden cronológico. En la práctica no
+            # pasa —`LibraryPiece.save()` la sella al publicar— pero una fila
+            # vieja sin sellar rompería la comparación del ordenamiento.
+            .exclude(published_at__isnull=True)
+            .order_by('-published_at', '-pk')
+        )
+        if tipo == 'article':
+            return [articulos], [NarratedArticleSerializer]
+        if tipo == 'library':
+            return [piezas], [NarratedLibrarySerializer]
+        return [articulos, piezas], [NarratedArticleSerializer, NarratedLibrarySerializer]
+
+    def get(self, request):
+        tipo = request.query_params.get('type') or None
+        # Mismo criterio que `_parse_limit`: un valor que no existe es un 400 y
+        # no una lista vacía silenciosa, que se lee igual que "no hay nada
+        # narrado" y manda a buscar el problema al lugar equivocado.
+        if tipo is not None and tipo not in ('article', 'library'):
+            raise ValidationError({'type': "Debe ser 'article' o 'library'."})
+
+        querysets, serializadores = self._querysets(tipo)
+        paginador = ArticlesPagination()
+        pagina = paginador.paginate_queryset(
+            _SecuenciaNarrada(querysets, serializadores), request, view=self
+        )
+        datos = [
+            serializador(pieza, context={'request': request}).data
+            for pieza, serializador in pagina
+        ]
+        return paginador.get_paginated_response(datos)

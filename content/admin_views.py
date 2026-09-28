@@ -4,7 +4,7 @@ from django.db.models import ProtectedError
 from rest_framework import generics, permissions, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.generics import get_object_or_404
-from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -16,6 +16,7 @@ from .serializers import (
     CategoryAdminSerializer,
     EventAdminSerializer,
     LibraryAdminSerializer,
+    RegionAdminSerializer,
     RegionSerializer,
     TagSerializer,
 )
@@ -148,13 +149,21 @@ class AdminRegionListCreateView(generics.ListCreateAPIView):
     queryset = Region.objects.all()
 
 
-class AdminRegionDeleteView(generics.DestroyAPIView):
-    """DELETE /api/admin/regions/<id>/ — equivalente a deleteRegion().
-    Region usa on_delete=SET_NULL en Article/Author, así que borrar una
-    región nunca falla por artículos/autores que la referencian: solo
-    quedan sin región asignada."""
+class AdminRegionDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE /api/admin/regions/<id>/.
 
+    El PATCH es la pantalla "Mapa Regional" del panel, donde lo único que se
+    edita es la imagen: se sube con multipart (`image`) y se quita con un
+    PATCH JSON `{"image": null}`.
+
+    DELETE sigue siendo el deleteRegion() de siempre. Region usa
+    on_delete=SET_NULL en Article/Author, así que borrar una región nunca
+    falla por artículos/autores que la referencian: solo quedan sin región
+    asignada."""
+
+    serializer_class = RegionAdminSerializer
     permission_classes = [permissions.IsAdminUser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     queryset = Region.objects.all()
 
 

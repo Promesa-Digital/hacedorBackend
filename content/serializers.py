@@ -1,3 +1,4 @@
+from django.utils.text import Truncator
 from rest_framework import serializers
 
 from .models import Article, Author, Category, Event, LibraryPiece, NewsletterSubscriber, Region, Tag, Volume
@@ -32,10 +33,36 @@ class NewsletterSubscriberSerializer(serializers.ModelSerializer):
 class RegionSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source='pk', read_only=True)
     articleCount = serializers.IntegerField(source='article_count', read_only=True)
+    imageUrl = serializers.SerializerMethodField()
 
     class Meta:
         model = Region
-        fields = ['id', 'name', 'code', 'articleCount']
+        fields = ['id', 'name', 'code', 'articleCount', 'imageUrl']
+
+    def get_imageUrl(self, obj):
+        # None y no '' cuando no hay imagen: la tarjeta del Mapa Regional
+        # decide con esto si dibuja la banda de imagen o no, y un string vacío
+        # es truthy-adyacente lo suficiente como para que alguien se confunda.
+        return _absolute_file_url(obj.image, self.context) or None
+
+
+class RegionAdminSerializer(RegionSerializer):
+    """Misma forma de lectura, más `image` escribible — lo único editable de
+    una región desde el panel. name/code se quedan como están (los escribe el
+    POST de alta, no la pantalla de imágenes)."""
+
+    image = serializers.ImageField(write_only=True, required=False, allow_null=True)
+
+    class Meta(RegionSerializer.Meta):
+        fields = RegionSerializer.Meta.fields + ['image']
+
+    def update(self, instance, validated_data):
+        # Si llega `image` (un archivo nuevo o null para quitarla), el archivo
+        # anterior se borra de disco. Sin esto, cambiar la foto de una región
+        # dos veces dejaría dos huérfanos en media/regions/ que nadie limpia.
+        if 'image' in validated_data and instance.image:
+            instance.image.delete(save=False)
+        return super().update(instance, validated_data)
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -147,6 +174,7 @@ class ArticleListSerializer(serializers.ModelSerializer):
     # exacta de un banner y no recortarle el nombre del entrevistado.
     coverImageWidth = serializers.IntegerField(source='cover_image_width', read_only=True)
     coverImageHeight = serializers.IntegerField(source='cover_image_height', read_only=True)
+    dropCap = serializers.BooleanField(source='drop_cap', read_only=True)
     hasNarration = serializers.BooleanField(source='has_narration', read_only=True)
     narrationAudioUrl = serializers.SerializerMethodField()
     youtubeEmbedUrl = serializers.CharField(source='youtube_embed_url', read_only=True)
@@ -159,6 +187,7 @@ class ArticleListSerializer(serializers.ModelSerializer):
             'id', 'slug', 'title', 'excerpt', 'category', 'tags', 'author',
             'publishedAt', 'readingTimeMinutes', 'coverImageUrl', 'coverImageOrientation',
             'coverImageWidth', 'coverImageHeight',
+            'dropCap',
             'hasNarration', 'narrationAudioUrl', 'youtubeEmbedUrl', 'spotifyEmbedUrl',
             'region', 'status', 'scheduledFor',
         ]
@@ -202,6 +231,9 @@ class ArticleAdminSerializer(ArticleDetailSerializer):
     # se guardaba (DRF ignora en silencio los campos read_only al escribir).
     youtubeEmbedUrl = serializers.CharField(source='youtube_embed_url', required=False, allow_blank=True)
     spotifyEmbedUrl = serializers.CharField(source='spotify_embed_url', required=False, allow_blank=True)
+    # Mismo motivo que los dos de arriba: heredado read_only no se guardaría
+    # nunca, y el interruptor del panel quedaría mudo.
+    dropCap = serializers.BooleanField(source='drop_cap', required=False)
     slug = serializers.SlugField(read_only=True)
 
     class Meta(ArticleDetailSerializer.Meta):
@@ -282,11 +314,12 @@ class LibrarySerializer(serializers.ModelSerializer):
     audioUrl = serializers.SerializerMethodField()
     sourceNote = serializers.CharField(source='source_note', read_only=True)
     publishedAt = serializers.DateTimeField(source='published_at', read_only=True)
+    dropCap = serializers.BooleanField(source='drop_cap', read_only=True)
 
     class Meta:
         model = LibraryPiece
         fields = [
-            'id', 'slug', 'title', 'genre', 'body',
+            'id', 'slug', 'title', 'genre', 'body', 'dropCap',
             'author', 'narrator', 'coverImageUrl', 'audioUrl', 'sourceNote', 'publishedAt',
         ]
 
@@ -312,6 +345,7 @@ class LibraryAdminSerializer(LibrarySerializer):
     coverImage = serializers.ImageField(source='cover_image', write_only=True, required=False, allow_null=True)
     audio = serializers.FileField(write_only=True, required=False, allow_null=True)
     sourceNote = serializers.CharField(source='source_note', required=False, allow_blank=True)
+    dropCap = serializers.BooleanField(source='drop_cap', required=False)
     slug = serializers.SlugField(read_only=True)
 
     class Meta(LibrarySerializer.Meta):
@@ -330,3 +364,97 @@ class LibraryAdminSerializer(LibrarySerializer):
             AuthorSerializer(instance.narrator, context=self.context).data if instance.narrator else None
         )
         return data
+
+
+class NarratedItemSerializer(serializers.ModelSerializer):
+    """Forma común de `/api/narrated/` para las dos cosas que se narran en la
+    revista: un artículo con `narration_audio` y una pieza de Biblioteca con
+    `audio`.
+
+    Son dos modelos distintos a propósito (ver el docstring de LibraryPiece), y
+    esa separación es correcta para todo el resto del sitio. Pero el listado de
+    narrados es UNA sola lista para quien escucha: no le importa si la voz está
+    leyendo una crítica de la revista o un poema de Vallejo. Por eso acá se
+    aplana a un puñado de campos comunes en vez de devolver las dos formas
+    nativas y hacer que el frontend adivine cuál le tocó.
+
+    `kind` es lo que queda de esa diferencia, y `url` viene ya armada del lado
+    del backend: es el único que sabe en qué ruta del frontend vive cada tipo, y
+    dejar que el cliente concatene `/articulo/` o `/biblioteca/` a mano fue
+    justo la clase de enlace sin barra final que rompió 21 links del sitio.
+    """
+
+    # Cada subclase fija su modelo, su etiqueta de tipo y su prefijo de ruta.
+    KIND = ''
+    PREFIJO_DE_RUTA = ''
+
+    kind = serializers.SerializerMethodField()
+    url = serializers.SerializerMethodField()
+    excerpt = serializers.SerializerMethodField()
+    label = serializers.SerializerMethodField()
+    author = AuthorSerializer(read_only=True)
+    narrator = serializers.SerializerMethodField()
+    audioUrl = serializers.SerializerMethodField()
+    publishedAt = serializers.DateTimeField(source='published_at', read_only=True)
+    coverImageUrl = serializers.SerializerMethodField()
+
+    class Meta:
+        fields = [
+            'kind', 'slug', 'title', 'url', 'excerpt', 'label',
+            'author', 'narrator', 'audioUrl', 'publishedAt', 'coverImageUrl',
+        ]
+
+    def get_kind(self, obj):
+        return self.KIND
+
+    def get_url(self, obj):
+        return f'{self.PREFIJO_DE_RUTA}{obj.slug}/'
+
+    def get_narrator(self, obj):
+        # Un artículo no tiene narrador cargado (el modelo no tiene el campo):
+        # getattr y no `obj.narrator` para que la misma clase sirva a los dos.
+        narrator = getattr(obj, 'narrator', None)
+        return AuthorSerializer(narrator, context=self.context).data if narrator else None
+
+    def get_coverImageUrl(self, obj):
+        return _absolute_file_url(obj.cover_image, self.context) or None
+
+
+class NarratedArticleSerializer(NarratedItemSerializer):
+    KIND = 'article'
+    PREFIJO_DE_RUTA = '/articulo/'
+
+    class Meta(NarratedItemSerializer.Meta):
+        model = Article
+
+    def get_excerpt(self, obj):
+        return obj.excerpt
+
+    def get_label(self, obj):
+        return obj.category.label
+
+    def get_audioUrl(self, obj):
+        return _absolute_file_url(obj.narration_audio, self.context) or None
+
+
+class NarratedLibrarySerializer(NarratedItemSerializer):
+    KIND = 'library'
+    PREFIJO_DE_RUTA = '/biblioteca/'
+
+    class Meta(NarratedItemSerializer.Meta):
+        model = LibraryPiece
+
+    def get_excerpt(self, obj):
+        # LibraryPiece no tiene `excerpt`: la obra es el cuerpo entero. Se
+        # recorta el arranque para que la fila del listado diga algo, y si la
+        # pieza todavía no tiene texto cargado queda la nota de procedencia
+        # ("de Trilce, 1922"), que es mejor que una fila muda.
+        if obj.body:
+            return Truncator(obj.body).chars(180)
+        return obj.source_note
+
+    def get_label(self, obj):
+        return obj.get_genre_display()
+
+    def get_audioUrl(self, obj):
+        return _absolute_file_url(obj.audio, self.context) or None
