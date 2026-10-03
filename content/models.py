@@ -23,9 +23,21 @@ def _unique_slug(model, value, instance_pk=None):
 
 
 class Region(models.Model):
-    """Región del Perú del Mapa Regional. `code` es el código INEI de dos o
-    tres cifras (ej. "040" para Arequipa) usado en las rutas públicas
-    (/mapa-regional/<code>) y como filtro de Article/Author."""
+    """Región del Mapa Regional. `code` es el código INEI de dos o tres cifras
+    (ej. "040" para Arequipa) usado en las rutas públicas
+    (/mapa-regional/<code>) y como filtro de Article/Author.
+
+    Excepción: "Internacional" (CODE_INTERNACIONAL) agrupa a los autores que
+    escriben desde fuera del Perú. No es una región del país, así que no tiene
+    código INEI y el frontend la saca de la grilla del mapa; de resto se
+    comporta como cualquier otra (página propia, filtro, conteo)."""
+
+    # Código de la región "Internacional". Es texto y no un número a propósito:
+    # los códigos del INEI son SIEMPRE numéricos de dos o tres cifras, así que
+    # un slug alfabético no puede chocar nunca con uno real, ni hoy ni cuando
+    # se carguen las 25 regiones que faltan. Y al ser legible queda una URL
+    # que se entiende sola: /mapa-regional/internacional/.
+    CODE_INTERNACIONAL = 'internacional'
 
     # Lado mayor de la miniatura de región. Muy por debajo de MAX_SIDE a
     # propósito: esta imagen solo se ve como banda superior de una tarjeta del
@@ -38,7 +50,10 @@ class Region(models.Model):
     MAX_SIDE_MINIATURA = 960
 
     name = models.CharField(max_length=100, unique=True)
-    code = models.CharField(max_length=10, unique=True)  # ej. "040"
+    # 20 y no 10: un código INEI entra de sobra en 10, pero el slug
+    # "internacional" son 13 caracteres y no se quiso abreviarlo a costa de la
+    # URL pública. El margen extra no cuesta nada en una tabla de 25 filas.
+    code = models.CharField(max_length=20, unique=True)  # ej. "040"
     # Imagen referente de la ciudad/región, opcional: el cliente va a cargar
     # las 25 de a poco, así que la tarjeta tiene que saber dibujarse sin ella.
     image = models.ImageField(upload_to='regions/', blank=True, null=True)
@@ -57,6 +72,16 @@ class Region(models.Model):
     @property
     def article_count(self):
         return self.articles.filter(status='published').count()
+
+    @property
+    def es_internacional(self):
+        """Si es la región de autores de fuera del Perú.
+
+        Se decide por `code` y no por `name`: el nombre se podría editar desde
+        la base y el código es el que está atado a la URL pública. El frontend
+        lee esto (campo `isInternational` del serializer) en vez de comparar
+        contra el texto "internacional" repartido en varios componentes."""
+        return self.code == self.CODE_INTERNACIONAL
 
 
 class Author(models.Model):
@@ -248,6 +273,35 @@ class Article(models.Model):
         ('panoramic', 'Banner'),
     ]
 
+    # Género del LIBRO RESEÑADO, no de la reseña. Una pieza de Crítica es un
+    # texto crítico; lo que se clasifica acá es la obra de la que habla ("esta
+    # crítica reseña un libro de cuentos"), que es lo que el cliente pidió para
+    # poder recorrer la sección como se recorre la Biblioteca.
+    #
+    # Lista PROPIA y no la de LibraryPiece a propósito: en la Biblioteca el
+    # género es de la pieza misma y son ocho (incluye microcuento y discurso);
+    # acá son estos seis. Atarlas obligaría a que las dos cambien juntas para
+    # siempre, y no son lo mismo. Ojo con 'poesia' (el cuerpo de obra de un
+    # libro) contra el 'poema' de la Biblioteca (una pieza suelta): la
+    # diferencia de valor es intencional.
+    #
+    # Tiene que coincidir con REVIEWED_GENRES de
+    # frontend/src/lib/reviewed-genres.ts, de donde salen el desplegable del
+    # panel y los chips públicos. Si se agrega uno acá, va también allá.
+    REVIEWED_GENRE_CHOICES = [
+        ('cuento', 'Cuento'),
+        ('novela', 'Novela'),
+        ('poesia', 'Poesía'),
+        ('ensayo', 'Ensayo'),
+        ('cronica', 'Crónica'),
+        ('otros', 'Otros textos'),
+    ]
+
+    # Slug de la categoría a la que pertenece el campo de arriba. Es el de
+    # "Crítica" — se llama 'articulos' por historia del proyecto (ver
+    # CATEGORY_HREFS en el frontend: /critica-literaria/ apunta a 'articulos').
+    CATEGORY_CRITICA = 'articulos'
+
     # A partir de acá una imagen deja de ser una foto apaisada y pasa a ser un
     # banner. Las portadas de las entrevistas son 2400x630 (3.8:1): metidas en
     # la caja 3:2 de una tarjeta se les recortaba el 61% del ancho y el nombre
@@ -269,6 +323,20 @@ class Article(models.Model):
     published_at = models.DateTimeField()
     scheduled_for = models.DateTimeField(null=True, blank=True)
     reading_time_minutes = models.PositiveIntegerField(default=1, help_text='Se autocalcula al guardar si se deja en 1.')
+
+    # Opcional y en blanco por defecto: las piezas que ya están cargadas no
+    # tienen género y tienen que seguir apareciendo en Crítica tal cual. "Sin
+    # género" es un estado legítimo y permanente, no un dato pendiente — hay
+    # reseñas de antologías, de revistas o de obra inclasificable.
+    #
+    # Sin null=True: un CharField usa '' para "vacío" y así hay un solo valor
+    # que significa lo mismo (el resto de los CharField del modelo hace igual).
+    reviewed_genre = models.CharField(
+        max_length=20,
+        choices=REVIEWED_GENRE_CHOICES,
+        blank=True,
+        help_text='Género del libro reseñado, no de la reseña. Solo aplica a Crítica.',
+    )
 
     cover_image = models.ImageField(upload_to='articles/', blank=True, null=True)
     cover_image_orientation = models.CharField(max_length=10, choices=ORIENTATION_CHOICES, default='landscape')
@@ -305,6 +373,17 @@ class Article(models.Model):
             word_count = len(self.body.split())
             self.reading_time_minutes = max(1, round(word_count / 200))
         self.has_narration = bool(self.narration_audio)
+        # El campo es de Crítica, pero el modelo es uno solo para las cuatro
+        # categorías. Se resolvió acá, limpiándolo al guardar, en vez de con un
+        # 400 desde el serializer: una entrevista nunca reseña un libro, así que
+        # un género cargado ahí es un descuido (o una pieza que se movió de
+        # sección después de clasificarla), y rechazar el guardado le haría
+        # perder el trabajo al editor por un campo que ni ve. Un CheckConstraint
+        # tampoco servía: dejaría la base coherente pero reventando con un 500
+        # en el mismo caso. Así las otras categorías siguen andando igual que
+        # antes y ninguna puede quedar con un género colgado.
+        if self.category_id and self.category.slug != self.CATEGORY_CRITICA:
+            self.reviewed_genre = ''
         # Igual razón que en Category.save(): el editor pega el link tal
         # cual lo copia del navegador, no el formato /embed/ que un <iframe>
         # necesita para no recibir "refused to connect".

@@ -319,6 +319,133 @@ class AuthorAdminTests(AdminAPITestCase):
         self.assertTrue(Author.objects.filter(pk=self.author.pk).exists())
 
 
+class AuthorUpdateTests(AdminAPITestCase):
+    """PATCH /api/admin/authors/<id>/ — la edición por fila del panel.
+
+    El cliente reportó que un autor se cargaba una vez y después no se podía
+    tocar más: la bio con un error de tipeo quedaba así para siempre, porque la
+    única acción de la fila era "Eliminar" y el borrado encima lo bloquea el
+    PROTECT en cuanto el autor tiene una publicación.
+    """
+
+    def test_sin_autenticacion_devuelve_401(self):
+        self.client.credentials()
+        respuesta = self.client.patch(f'/api/admin/authors/{self.author.id}/', {'bio': 'Colada'}, format='json')
+        self.assertEqual(respuesta.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.author.refresh_from_db()
+        self.assertEqual(self.author.bio, '')
+
+    def test_edita_la_bio(self):
+        respuesta = self.client.patch(
+            f'/api/admin/authors/{self.author.id}/',
+            {'bio': 'Narradora arequipeña. Publicó dos libros de cuentos.'},
+            format='json',
+        )
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertEqual(respuesta.data['bio'], 'Narradora arequipeña. Publicó dos libros de cuentos.')
+        self.author.refresh_from_db()
+        self.assertEqual(self.author.bio, 'Narradora arequipeña. Publicó dos libros de cuentos.')
+
+    def test_edita_nombre_bio_y_region_en_un_solo_envio(self):
+        respuesta = self.client.patch(
+            f'/api/admin/authors/{self.author.id}/',
+            {'name': 'Autora Corregida', 'bio': 'Bio nueva', 'region': self.region.id},
+            format='json',
+        )
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        # La región sale como nombre, no como id: misma forma de lectura que el alta.
+        self.assertEqual(respuesta.data['region'], self.region.name)
+        self.author.refresh_from_db()
+        self.assertEqual(self.author.name, 'Autora Corregida')
+        self.assertEqual(self.author.region, self.region)
+
+    def test_se_le_puede_quitar_la_region(self):
+        self.author.region = self.region
+        self.author.save(update_fields=['region'])
+
+        respuesta = self.client.patch(f'/api/admin/authors/{self.author.id}/', {'region': None}, format='json')
+
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIsNone(respuesta.data['region'])
+        self.author.refresh_from_db()
+        self.assertIsNone(self.author.region)
+
+    def test_una_region_vacia_en_multipart_desasigna(self):
+        # El panel manda el formulario como multipart (por el avatar) y un
+        # FormData no sabe expresar `null`: la región sin elegir viaja como
+        # cadena vacía. Si esto dejara de traducirse a null, "Sin región" en el
+        # desplegable guardaría la región anterior sin avisar.
+        self.author.region = self.region
+        self.author.save(update_fields=['region'])
+
+        respuesta = self.client.patch(
+            f'/api/admin/authors/{self.author.id}/',
+            {'name': self.author.name, 'bio': 'x', 'region': ''},
+            format='multipart',
+        )
+
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIsNone(respuesta.data['region'])
+        self.author.refresh_from_db()
+        self.assertIsNone(self.author.region)
+
+    def test_un_nombre_vacio_se_rechaza(self):
+        respuesta = self.client.patch(f'/api/admin/authors/{self.author.id}/', {'name': '   '}, format='json')
+        self.assertEqual(respuesta.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('name', respuesta.data)
+        self.author.refresh_from_db()
+        self.assertEqual(self.author.name, 'Autora de prueba')
+
+    def test_una_region_inexistente_se_rechaza(self):
+        respuesta = self.client.patch(f'/api/admin/authors/{self.author.id}/', {'region': 999999}, format='json')
+        self.assertEqual(respuesta.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('region', respuesta.data)
+
+    def test_reemplazar_el_avatar_borra_el_anterior(self):
+        primera = self.client.patch(
+            f'/api/admin/authors/{self.author.id}/',
+            {'avatar': SimpleUploadedFile('foto.jpg', _imagen_bytes(400, 400), content_type='image/jpeg')},
+            format='multipart',
+        )
+        self.assertEqual(primera.status_code, status.HTTP_200_OK)
+        self.author.refresh_from_db()
+        ruta_anterior = self.author.avatar.name
+        self.assertTrue(default_storage.exists(ruta_anterior))
+
+        segunda = self.client.patch(
+            f'/api/admin/authors/{self.author.id}/',
+            {'avatar': SimpleUploadedFile('otra.jpg', _imagen_bytes(300, 300), content_type='image/jpeg')},
+            format='multipart',
+        )
+
+        self.assertEqual(segunda.status_code, status.HTTP_200_OK)
+        self.author.refresh_from_db()
+        self.assertNotEqual(self.author.avatar.name, ruta_anterior)
+        # Sin el update() del serializer esto dejaba un huérfano en media/authors/.
+        self.assertFalse(default_storage.exists(ruta_anterior))
+
+    def test_se_puede_editar_un_autor_con_publicaciones(self):
+        # El caso que hacía imposible corregir nada: con una publicación
+        # asociada, el DELETE devuelve 400 por el PROTECT, así que "borrar y
+        # cargar de nuevo" tampoco era una salida.
+        Article.objects.create(
+            title='Escrito por esta autora',
+            slug='escrito-por-esta-autora',
+            excerpt='x',
+            body='x',
+            category=self.category,
+            author=self.author,
+            published_at=timezone.now(),
+            status='published',
+        )
+
+        respuesta = self.client.patch(f'/api/admin/authors/{self.author.id}/', {'bio': 'Bio al día'}, format='json')
+
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.author.refresh_from_db()
+        self.assertEqual(self.author.bio, 'Bio al día')
+
+
 class TagAdminTests(AdminAPITestCase):
     def test_create_tag(self):
         res = self.client.post('/api/admin/tags/', {'label': 'Nueva etiqueta'}, format='json')
@@ -1504,3 +1631,244 @@ class LetraCapitalTests(AdminAPITestCase):
         respuesta = self.client.patch(f'/api/articles/{slug}/', {'dropCap': True}, format='json')
         self.assertIn(respuesta.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN, status.HTTP_405_METHOD_NOT_ALLOWED))
         self.assertFalse(Article.objects.get(slug=slug).drop_cap)
+
+
+class RegionInternacionalTests(AdminAPITestCase):
+    """La región "Internacional": autores que escriben desde fuera del Perú.
+
+    El cliente pidió una pestaña "Internacional" y una opción "Internacional"
+    en el desplegable de región. Se resolvió con lo segundo: es una región más,
+    así que funciona en todas las secciones y no agrega un noveno ítem al menú.
+
+    La crea la migración 0013, no el panel — de ahí que estas pruebas no la
+    creen: si falta, es que la migración no corrió y eso es justo lo que hay
+    que detectar.
+    """
+
+    def _internacional(self):
+        return Region.objects.get(code=Region.CODE_INTERNACIONAL)
+
+    def _correr_migracion(self):
+        import importlib
+
+        from django.apps import apps
+
+        modulo = importlib.import_module('content.migrations.0013_region_internacional')
+        modulo.crear_internacional(apps, None)
+
+    def test_la_migracion_la_creo(self):
+        region = self._internacional()
+        self.assertEqual(region.name, 'Internacional')
+        self.assertTrue(region.es_internacional)
+
+    def test_el_codigo_no_puede_chocar_con_uno_del_INEI(self):
+        # Los códigos del INEI son numéricos de dos o tres cifras. Mientras el
+        # de Internacional sea alfabético, no hay colisión posible.
+        self.assertFalse(Region.CODE_INTERNACIONAL.isdigit())
+
+    def test_correr_la_migracion_de_nuevo_no_duplica(self):
+        self._correr_migracion()
+        self._correr_migracion()
+        self.assertEqual(Region.objects.filter(code=Region.CODE_INTERNACIONAL).count(), 1)
+
+    def test_correr_la_migracion_de_nuevo_no_pisa_el_nombre(self):
+        # get_or_create con defaults: si alguien ajustó el nombre desde la
+        # base, una segunda corrida lo respeta.
+        Region.objects.filter(code=Region.CODE_INTERNACIONAL).update(name='Internacional (editado)')
+        self._correr_migracion()
+        self.assertEqual(self._internacional().name, 'Internacional (editado)')
+
+    def test_la_api_publica_de_regiones_la_devuelve_marcada(self):
+        self.client.credentials()
+        respuesta = self.client.get('/api/regions/')
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        internacional = next(r for r in respuesta.data if r['code'] == Region.CODE_INTERNACIONAL)
+        self.assertEqual(internacional['name'], 'Internacional')
+        self.assertIs(internacional['isInternational'], True)
+
+    def test_las_regiones_del_peru_no_vienen_marcadas(self):
+        # La bandera es lo único que usa el frontend para sacarla de la grilla
+        # del Mapa Regional, así que un falso positivo escondería una región
+        # peruana del mapa.
+        self.client.credentials()
+        respuesta = self.client.get('/api/regions/')
+        propia = next(r for r in respuesta.data if r['code'] == self.region.code)
+        self.assertIs(propia['isInternational'], False)
+
+    def test_su_pagina_responde_y_lista_sus_piezas(self):
+        Article.objects.create(
+            title='Carta desde Berlín',
+            slug='carta-desde-berlin',
+            excerpt='x',
+            body='x',
+            category=self.category,
+            author=self.author,
+            region=self._internacional(),
+            published_at=timezone.now(),
+            status='published',
+        )
+        self.client.credentials()
+
+        detalle = self.client.get(f'/api/regions/{Region.CODE_INTERNACIONAL}/')
+        self.assertEqual(detalle.status_code, status.HTTP_200_OK)
+        self.assertEqual(detalle.data['articleCount'], 1)
+
+        listado = self.client.get(f'/api/articles/?region={Region.CODE_INTERNACIONAL}')
+        self.assertEqual(listado.status_code, status.HTTP_200_OK)
+        slugs = [a['slug'] for a in listado.data['items']]
+        self.assertIn('carta-desde-berlin', slugs)
+
+    def test_lista_sus_autores(self):
+        Author.objects.create(name='Autor de Berlín', region=self._internacional())
+        self.client.credentials()
+        respuesta = self.client.get(f'/api/regions/{Region.CODE_INTERNACIONAL}/authors/')
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertEqual([a['name'] for a in respuesta.data], ['Autor de Berlín'])
+
+    def test_no_se_puede_borrar_desde_el_panel(self):
+        respuesta = self.client.delete(f'/api/admin/regions/{self._internacional().id}/')
+        self.assertEqual(respuesta.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Internacional', respuesta.data['detail'])
+        self.assertTrue(Region.objects.filter(code=Region.CODE_INTERNACIONAL).exists())
+
+    def test_borrarla_no_deja_sin_region_a_sus_publicaciones(self):
+        # El daño concreto que evita la protección: Article.region es SET_NULL,
+        # así que un borrado exitoso vaciaría la región de cada pieza en
+        # silencio.
+        articulo = Article.objects.create(
+            title='Reseña desde Madrid',
+            slug='resena-desde-madrid',
+            excerpt='x',
+            body='x',
+            category=self.category,
+            author=self.author,
+            region=self._internacional(),
+            published_at=timezone.now(),
+            status='published',
+        )
+        self.client.delete(f'/api/admin/regions/{self._internacional().id}/')
+        articulo.refresh_from_db()
+        self.assertIsNotNone(articulo.region)
+
+    def test_las_demas_regiones_se_siguen_borrando(self):
+        respuesta = self.client.delete(f'/api/admin/regions/{self.region.id}/')
+        self.assertEqual(respuesta.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_se_le_puede_cargar_imagen_como_a_cualquier_region(self):
+        respuesta = self.client.patch(
+            f'/api/admin/regions/{self._internacional().id}/',
+            {'image': SimpleUploadedFile('mundo.jpg', _imagen_bytes(1600, 1200), content_type='image/jpeg')},
+            format='multipart',
+        )
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertIsNotNone(respuesta.data['imageUrl'])
+
+
+class GeneroDelLibroResenadoTests(AdminAPITestCase):
+    """El género del LIBRO RESEÑADO en una pieza de Crítica.
+
+    No es el género de la reseña: la pieza es un texto crítico y lo que se
+    clasifica es la obra de la que habla. Por eso tiene lista propia y no la de
+    la Biblioteca (ver el comentario de Article.REVIEWED_GENRE_CHOICES)."""
+
+    def _resena(self, **extra):
+        datos = {
+            'title': extra.pop('title', 'Reseña de prueba'),
+            'excerpt': 'x',
+            'body': 'x',
+            'category': self.category.slug,
+            'author': self.author.id,
+            'status': 'published',
+        }
+        datos.update(extra)
+        return self.client.post('/api/admin/articles/', datos, format='multipart')
+
+    def test_son_los_seis_que_pidio_el_cliente(self):
+        self.assertEqual(
+            Article.REVIEWED_GENRE_CHOICES,
+            [
+                ('cuento', 'Cuento'),
+                ('novela', 'Novela'),
+                ('poesia', 'Poesía'),
+                ('ensayo', 'Ensayo'),
+                ('cronica', 'Crónica'),
+                ('otros', 'Otros textos'),
+            ],
+        )
+
+    def test_todos_entran_en_el_campo(self):
+        largo = Article._meta.get_field('reviewed_genre').max_length
+        for valor, _ in Article.REVIEWED_GENRE_CHOICES:
+            self.assertLessEqual(len(valor), largo, valor)
+
+    def test_se_guarda_desde_el_panel_y_vuelve_en_camel_case(self):
+        respuesta = self._resena(reviewedGenre='novela')
+        self.assertEqual(respuesta.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(respuesta.data['reviewedGenre'], 'novela')
+        self.assertEqual(Article.objects.get(pk=respuesta.data['id']).reviewed_genre, 'novela')
+
+    def test_viaja_al_sitio_publico(self):
+        slug = self._resena(reviewedGenre='poesia').data['slug']
+        self.client.credentials()
+        self.assertEqual(self.client.get(f'/api/articles/{slug}/').data['reviewedGenre'], 'poesia')
+        listado = self.client.get('/api/articles/').data['items']
+        self.assertEqual([p['reviewedGenre'] for p in listado], ['poesia'])
+
+    def test_se_puede_volver_a_dejar_sin_genero(self):
+        # El camino de vuelta: el editor eligió mal y pone "Sin especificar".
+        pk = self._resena(reviewedGenre='cronica').data['id']
+        respuesta = self.client.patch(f'/api/admin/articles/{pk}/', {'reviewedGenre': ''}, format='multipart')
+        self.assertEqual(respuesta.status_code, status.HTTP_200_OK)
+        self.assertEqual(Article.objects.get(pk=pk).reviewed_genre, '')
+
+    def test_un_genero_inventado_desde_el_panel_da_400(self):
+        respuesta = self._resena(reviewedGenre='haiku')
+        self.assertEqual(respuesta.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('reviewedGenre', respuesta.data)
+
+    def test_el_filtro_publico_separa_por_genero(self):
+        self._resena(title='Un libro de cuentos', reviewedGenre='cuento')
+        self._resena(title='Una novela larga', reviewedGenre='novela')
+        self.client.credentials()
+        listado = self.client.get('/api/articles/?reviewedGenre=cuento').data['items']
+        self.assertEqual([p['title'] for p in listado], ['Un libro de cuentos'])
+
+    def test_un_genero_invalido_en_el_filtro_da_400(self):
+        # Mismo criterio que ?limit= con basura: 400 y no un 500 ni una lista
+        # vacía que se confunda con "no hay piezas de ese género".
+        self.client.credentials()
+        self.assertEqual(
+            self.client.get('/api/articles/?reviewedGenre=haiku').status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    def test_una_pieza_sin_genero_sigue_apareciendo_en_el_listado(self):
+        # Lo que NO puede pasar: las reseñas que ya están cargadas no tienen
+        # género y tienen que seguir viéndose en Crítica.
+        self._resena(title='Reseña vieja sin género')
+        self.client.credentials()
+        listado = self.client.get('/api/articles/?category=articulos').data['items']
+        self.assertEqual([p['title'] for p in listado], ['Reseña vieja sin género'])
+        self.assertEqual(listado[0]['reviewedGenre'], '')
+
+    def test_una_pieza_sin_genero_no_sale_al_filtrar(self):
+        self._resena(title='Sin género')
+        self._resena(title='Con género', reviewedGenre='ensayo')
+        self.client.credentials()
+        listado = self.client.get('/api/articles/?reviewedGenre=ensayo').data['items']
+        self.assertEqual([p['title'] for p in listado], ['Con género'])
+
+    def test_una_entrevista_no_se_queda_con_el_genero_colgado(self):
+        # El campo es de Crítica: si la pieza se mueve a otra sección, el
+        # género del libro reseñado deja de tener sentido y se limpia al
+        # guardar en vez de rechazar el guardado entero.
+        entrevistas = Category.objects.create(slug='entrevistas', label='Entrevistas')
+        respuesta = self._resena(title='Charla con alguien', category=entrevistas.slug, reviewedGenre='novela')
+        self.assertEqual(respuesta.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Article.objects.get(pk=respuesta.data['id']).reviewed_genre, '')
+
+    def test_mover_una_resena_a_otra_categoria_le_saca_el_genero(self):
+        entrevistas = Category.objects.create(slug='entrevistas', label='Entrevistas')
+        pk = self._resena(reviewedGenre='cuento').data['id']
+        self.client.patch(f'/api/admin/articles/{pk}/', {'category': entrevistas.slug}, format='multipart')
+        self.assertEqual(Article.objects.get(pk=pk).reviewed_genre, '')

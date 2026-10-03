@@ -117,14 +117,25 @@ class AdminAuthorListCreateView(generics.ListCreateAPIView):
     queryset = Author.objects.all()
 
 
-class AdminAuthorDeleteView(generics.DestroyAPIView):
-    """DELETE /api/admin/authors/<id>/ — a diferencia de Region, Author usa
-    on_delete=PROTECT en Article.author y Volume.author (a propósito: no
-    queremos que borrar un autor deje huérfano su contenido publicado), así
-    que acá sí puede fallar — se traduce a un 400 con mensaje claro en vez
-    del 500 que tiraría Django por default."""
+class AdminAuthorDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET/PATCH/DELETE /api/admin/authors/<id>/.
 
+    El PATCH es la edición por fila de la sección "Autores" del panel: hasta
+    ahora un autor se cargaba una vez y no había forma de corregirlo, así que
+    arreglar una bio con un error de tipeo obligaba a borrar al autor — y si ya
+    tenía publicaciones, el PROTECT de abajo no lo dejaba ni eso. Mismo patrón
+    que AdminRegionDetailView: multipart cuando se reemplaza `avatar`, JSON
+    para el resto de los campos.
+
+    DELETE: a diferencia de Region, Author usa on_delete=PROTECT en
+    Article.author y Volume.author (a propósito: no queremos que borrar un
+    autor deje huérfano su contenido publicado), así que acá sí puede fallar —
+    se traduce a un 400 con mensaje claro en vez del 500 que tiraría Django por
+    default."""
+
+    serializer_class = AuthorAdminSerializer
     permission_classes = [permissions.IsAdminUser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     queryset = Author.objects.all()
 
     def destroy(self, request, *args, **kwargs):
@@ -165,6 +176,29 @@ class AdminRegionDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAdminUser]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     queryset = Region.objects.all()
+
+    def destroy(self, request, *args, **kwargs):
+        # "Internacional" no se puede borrar. No es una región que el cliente
+        # haya dado de alta: la crea una migración y es la única vía para
+        # publicar autores de fuera del Perú. Si se borra, el SET_NULL deja sin
+        # región a todas esas publicaciones en silencio y recuperarlo exige
+        # recrearla con el MISMO código (o se rompen los enlaces a
+        # /mapa-regional/internacional/) y reasignar cada pieza a mano.
+        #
+        # Se prohíbe en vez de ocultar el botón del panel y nada más: la API de
+        # admin es pública para cualquiera con sesión, y la defensa tiene que
+        # estar donde está el daño. El resto de las regiones se sigue borrando
+        # igual que antes.
+        #
+        # 400 y no 403: el permiso está bien, lo que no se puede es esta
+        # operación sobre este objeto — y es el mismo 400 con mensaje claro que
+        # ya devuelve el borrado de un autor con publicaciones.
+        if self.get_object().es_internacional:
+            return Response(
+                {'detail': 'No se puede eliminar: “Internacional” es una región del sistema y la necesitan las publicaciones de autores de fuera del Perú.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 class AdminCategoryListView(generics.ListAPIView):

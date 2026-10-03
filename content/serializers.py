@@ -34,10 +34,16 @@ class RegionSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source='pk', read_only=True)
     articleCount = serializers.IntegerField(source='article_count', read_only=True)
     imageUrl = serializers.SerializerMethodField()
+    # El frontend necesita distinguir "Internacional" del resto para sacarla de
+    # la grilla del Mapa Regional (que es un mapa del Perú). Viaja como bandera
+    # calculada en el modelo y no como una comparación de strings repetida en
+    # cada componente de Astro: si algún día cambia el código, cambia en un
+    # solo lugar.
+    isInternational = serializers.BooleanField(source='es_internacional', read_only=True)
 
     class Meta:
         model = Region
-        fields = ['id', 'name', 'code', 'articleCount', 'imageUrl']
+        fields = ['id', 'name', 'code', 'articleCount', 'imageUrl', 'isInternational']
 
     def get_imageUrl(self, obj):
         # None y no '' cuando no hay imagen: la tarjeta del Mapa Regional
@@ -135,6 +141,15 @@ class AuthorAdminSerializer(AuthorSerializer):
         data['region'] = instance.region.name if instance.region else None
         return data
 
+    def update(self, instance, validated_data):
+        # Mismo criterio que RegionAdminSerializer: si llega `avatar` (una foto
+        # nueva o null para quitarla), la anterior se borra de disco. Sin esto,
+        # cambiarle la foto a un autor dos veces deja dos huérfanos en
+        # media/authors/ que nadie va a limpiar nunca.
+        if 'avatar' in validated_data and instance.avatar:
+            instance.avatar.delete(save=False)
+        return super().update(instance, validated_data)
+
 
 class TagSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source='pk', read_only=True)
@@ -175,6 +190,10 @@ class ArticleListSerializer(serializers.ModelSerializer):
     coverImageWidth = serializers.IntegerField(source='cover_image_width', read_only=True)
     coverImageHeight = serializers.IntegerField(source='cover_image_height', read_only=True)
     dropCap = serializers.BooleanField(source='drop_cap', read_only=True)
+    # Género del libro reseñado, no de la reseña. Viaja como cadena vacía
+    # cuando la pieza no tiene uno (lo normal fuera de Crítica, y también en las
+    # reseñas viejas): el frontend decide con eso si dibuja la leyenda o no.
+    reviewedGenre = serializers.CharField(source='reviewed_genre', read_only=True)
     hasNarration = serializers.BooleanField(source='has_narration', read_only=True)
     narrationAudioUrl = serializers.SerializerMethodField()
     youtubeEmbedUrl = serializers.CharField(source='youtube_embed_url', read_only=True)
@@ -187,7 +206,7 @@ class ArticleListSerializer(serializers.ModelSerializer):
             'id', 'slug', 'title', 'excerpt', 'category', 'tags', 'author',
             'publishedAt', 'readingTimeMinutes', 'coverImageUrl', 'coverImageOrientation',
             'coverImageWidth', 'coverImageHeight',
-            'dropCap',
+            'dropCap', 'reviewedGenre',
             'hasNarration', 'narrationAudioUrl', 'youtubeEmbedUrl', 'spotifyEmbedUrl',
             'region', 'status', 'scheduledFor',
         ]
@@ -234,6 +253,16 @@ class ArticleAdminSerializer(ArticleDetailSerializer):
     # Mismo motivo que los dos de arriba: heredado read_only no se guardaría
     # nunca, y el interruptor del panel quedaría mudo.
     dropCap = serializers.BooleanField(source='drop_cap', required=False)
+    # Mismo motivo que dropCap: heredado read_only, el desplegable del panel no
+    # se guardaría nunca. `allow_blank` es el camino por el que el editor
+    # vuelve a dejar la pieza sin género, y ChoiceField valida la lista sola
+    # (un valor inventado da 400 con el campo señalado).
+    reviewedGenre = serializers.ChoiceField(
+        source='reviewed_genre',
+        choices=Article.REVIEWED_GENRE_CHOICES,
+        required=False,
+        allow_blank=True,
+    )
     slug = serializers.SlugField(read_only=True)
 
     class Meta(ArticleDetailSerializer.Meta):

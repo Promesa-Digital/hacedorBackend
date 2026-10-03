@@ -53,8 +53,25 @@ def _parse_limit(query_params, default):
     return value
 
 
+def _parse_reviewed_genre(query_params):
+    """Valida ?reviewedGenre= contra la lista del modelo.
+
+    400 y no "devolvé vacío" como hace el filtro de la Biblioteca: acá el chip
+    público manda siempre un valor de la lista, así que un género desconocido
+    es un error del cliente y no una búsqueda sin resultados. Mismo criterio que
+    `_parse_limit`. La página de Crítica igual valida antes de pedir, así que un
+    ?genero= escrito a mano en el navegador no llega hasta acá."""
+    raw = query_params.get('reviewedGenre')
+    if not raw:
+        return None
+    validos = [valor for valor, _ in Article.REVIEWED_GENRE_CHOICES]
+    if raw not in validos:
+        raise ValidationError({'reviewedGenre': f'Debe ser uno de: {", ".join(validos)}.'})
+    return raw
+
+
 class ArticleListView(generics.ListAPIView):
-    """GET /api/articles/?category=&region=&tag=&page=&pageSize= — equivalente a getArticles()."""
+    """GET /api/articles/?category=&region=&tag=&reviewedGenre=&page=&pageSize= — equivalente a getArticles()."""
 
     serializer_class = ArticleListSerializer
     pagination_class = ArticlesPagination
@@ -64,12 +81,15 @@ class ArticleListView(generics.ListAPIView):
         category = self.request.query_params.get('category')
         region_code = self.request.query_params.get('region')
         tag_slug = self.request.query_params.get('tag')
+        reviewed_genre = _parse_reviewed_genre(self.request.query_params)
         if category:
             qs = qs.filter(category__slug=category)
         if region_code:
             qs = qs.filter(region__code=region_code)
         if tag_slug:
             qs = qs.filter(tags__slug=tag_slug)
+        if reviewed_genre:
+            qs = qs.filter(reviewed_genre=reviewed_genre)
         return qs.distinct()
 
 
