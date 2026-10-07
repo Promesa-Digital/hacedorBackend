@@ -3,10 +3,11 @@ import tempfile
 from pathlib import Path as PathLib
 from unittest.mock import patch
 
+from django.apps import apps
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from PIL import Image
 from rest_framework import status
@@ -1048,6 +1049,22 @@ class LibraryPieceModelTests(AdminAPITestCase):
         with Image.open(pieza.cover_image) as img:
             self.assertEqual(max(img.size), 2400)
 
+    def test_no_deja_el_original_en_disco(self):
+        """El archivo que sube el editor se convierte a WebP y el original debe
+        desaparecer. Mientras no se borraba, cada imagen ocupaba el doble: en
+        producción se midieron 8 archivos huérfanos en las primeras semanas, y
+        esa cuenta crece con cada publicación."""
+        from pathlib import Path as _Path
+
+        pieza = self._pieza(
+            cover_image=SimpleUploadedFile('zzorig.jpg', _imagen_bytes(3000, 2000), content_type='image/jpeg')
+        )
+        pieza.refresh_from_db()
+        self.assertTrue(pieza.cover_image.name.endswith('.webp'), pieza.cover_image.name)
+
+        sobrantes = [p.name for p in _Path(MEDIA_DE_PRUEBA).rglob('zzorig*') if p.suffix != '.webp']
+        self.assertEqual(sobrantes, [], f'quedó el original sin borrar: {sobrantes}')
+
     def test_al_publicar_se_sella_la_fecha(self):
         self.assertIsNotNone(self._pieza(status='published').published_at)
 
@@ -1872,3 +1889,91 @@ class GeneroDelLibroResenadoTests(AdminAPITestCase):
         pk = self._resena(reviewedGenre='cuento').data['id']
         self.client.patch(f'/api/admin/articles/{pk}/', {'category': entrevistas.slug}, format='multipart')
         self.assertEqual(Article.objects.get(pk=pk).reviewed_genre, '')
+
+
+@override_settings(MEDIA_ROOT=MEDIA_DE_PRUEBA)
+class ArchivosSinDuenoTests(TestCase):
+    """Django no borra del disco el archivo de un FileField, ni al eliminar el
+    registro ni al reemplazarlo. En producción se midieron 8 archivos sin dueño
+    en las primeras semanas; como el 96 % del disco es audio de narraciones de
+    decenas de megas, cada reemplazo que no se limpia se paga en almacenamiento."""
+
+    def setUp(self):
+        self.region = Region.objects.create(name='Arequipa', code='040')
+        self.author = Author.objects.create(name='César Vallejo', region=self.region)
+        self.categoria, _ = Category.objects.get_or_create(
+            slug='articulos', defaults={'label': 'Crítica'}
+        )
+
+    def _subida(self, nombre):
+        return SimpleUploadedFile(nombre, _imagen_bytes(900, 600), content_type='image/jpeg')
+
+    def _existe(self, campo):
+        return campo.storage.exists(campo.name)
+
+    def test_al_borrar_la_pieza_se_borra_su_portada(self):
+        pieza = LibraryPiece.objects.create(
+            title='Masa', author=self.author, genre='poema', cover_image=self._subida('zzdel.jpg')
+        )
+        ruta, almacen = pieza.cover_image.name, pieza.cover_image.storage
+        self.assertTrue(almacen.exists(ruta))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            pieza.delete()
+        self.assertFalse(almacen.exists(ruta), 'la portada quedó en disco sin dueño')
+
+    def test_al_reemplazar_la_portada_se_borra_la_anterior(self):
+        pieza = LibraryPiece.objects.create(
+            title='Masa', author=self.author, genre='poema', cover_image=self._subida('zzvieja.jpg')
+        )
+        anterior, almacen = pieza.cover_image.name, pieza.cover_image.storage
+
+        pieza.cover_image = self._subida('zznueva.jpg')
+        with self.captureOnCommitCallbacks(execute=True):
+            pieza.save()
+
+        self.assertFalse(almacen.exists(anterior), 'la portada anterior quedó en disco')
+        self.assertTrue(almacen.exists(pieza.cover_image.name), 'se borró la portada nueva')
+
+    def test_guardar_sin_tocar_la_portada_no_la_borra(self):
+        """El caso que rompería todo: editar el título de una pieza NO puede
+        llevarse puesta su imagen."""
+        pieza = LibraryPiece.objects.create(
+            title='Masa', author=self.author, genre='poema', cover_image=self._subida('zzintacta.jpg')
+        )
+        pieza.title = 'Masa (revisado)'
+        with self.captureOnCommitCallbacks(execute=True):
+            pieza.save()
+
+        pieza.refresh_from_db()
+        self.assertTrue(self._existe(pieza.cover_image), 'se borró la portada de una pieza que no la cambió')
+
+    def test_al_borrar_el_articulo_se_borra_su_narracion(self):
+        articulo = Article.objects.create(
+            title='ZZ con voz', excerpt='x', body='x',
+            category=self.categoria,
+            author=self.author, status='published', published_at=timezone.now(),
+            narration_audio=SimpleUploadedFile('zzvoz.mp3', b'audio falso', content_type='audio/mpeg'),
+        )
+        ruta, almacen = articulo.narration_audio.name, articulo.narration_audio.storage
+        with self.captureOnCommitCallbacks(execute=True):
+            articulo.delete()
+        self.assertFalse(almacen.exists(ruta), 'el audio quedó en disco sin dueño')
+
+    def test_todos_los_modelos_con_archivos_estan_cubiertos(self):
+        """Si mañana alguien agrega un FileField y no lo suma al registro, sus
+        archivos empiezan a acumularse en silencio. Esta prueba lo impide."""
+        from django.db.models import FileField
+
+        from content import archivos, models as modelos
+
+        faltantes = []
+        for modelo in apps.get_app_config('content').get_models():
+            campos = {c.name for c in modelo._meta.get_fields() if isinstance(c, FileField)}
+            if not campos:
+                continue
+            cubiertos = set(archivos.CAMPOS_DE_ARCHIVO.get(modelo, ()))
+            if campos - cubiertos:
+                faltantes.append(f'{modelo.__name__}: {sorted(campos - cubiertos)}')
+
+        self.assertEqual(faltantes, [], f'campos de archivo sin limpieza: {faltantes}')
